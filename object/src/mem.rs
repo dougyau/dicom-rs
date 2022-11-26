@@ -1915,17 +1915,20 @@ where
                     }
 
                     // fetch respective value, place it in the entries
-                    let next_token = dataset.next().context(MissingElementValueSnafu)?;
-                    match next_token.context(ReadTokenSnafu)? {
-                        DataToken::PrimitiveValue(v) => InMemElement::new_with_len(
-                            header.tag,
-                            header.vr,
-                            header.len,
-                            Value::Primitive(v),
-                        ),
-                        token => {
-                            return UnexpectedTokenSnafu { token }.fail();
+                    if let Ok(next_token) = dataset.next().context(MissingElementValueSnafu)? {
+                        match next_token {
+                            DataToken::PrimitiveValue(v) => InMemElement::new_with_len(
+                                header.tag,
+                                header.vr,
+                                header.len,
+                                Value::Primitive(v),
+                            ),
+                            token => {
+                                return UnexpectedTokenSnafu { token }.fail();
+                            }
                         }
+                    } else {
+                        continue;
                     }
                 }
                 DataToken::SequenceStart { tag, len } => {

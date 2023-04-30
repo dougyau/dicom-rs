@@ -228,6 +228,13 @@ impl<I, P> DataElement<I, P> {
     pub fn into_value(self) -> Value<I, P> {
         self.value
     }
+
+    /// Split the constituent parts of this element into a tuple.
+    /// If the value is a sequence,
+    /// its lifetime may still be bound to the original source.
+    pub fn into_parts(self) -> (DataElementHeader, Value<I, P>) {
+        (self.header, self.value)
+    }
 }
 
 impl<I, P> DataElement<I, P>
@@ -486,10 +493,25 @@ where
 
     /// Retrieve the items stored in a sequence value.
     ///
-    /// Returns `None` if the value is not a sequence.
+    /// Returns `None` if the value is not a data set sequence.
     pub fn items(&self) -> Option<&[I]> {
         self.value().items()
     }
+
+    /// Retrieve the fragments stored in a pixel data sequence value.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn fragments(&self) -> Option<&[P]> {
+        self.value().fragments()
+    }
+
+    /// Obtain a reference to the encapsulated pixel data's basic offset table.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn offset_table(&self) -> Option<&[u32]> {
+        self.value().offset_table()
+    }
+
 }
 
 impl<'v, I, P> DataElementRef<'v, I, P>

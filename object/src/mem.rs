@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use snafu::{OptionExt, ResultExt};
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::{collections::BTreeMap, io::Write};
 
@@ -16,15 +16,16 @@ use crate::ops::{
 };
 use crate::{meta::FileMetaTable, FileMetaTableBuilder};
 use crate::{
-    BuildMetaTableSnafu, CreateParserSnafu, CreatePrinterSnafu, DicomObject, FileDicomObject,
-    MissingElementValueSnafu, NoSuchAttributeNameSnafu, NoSuchDataElementAliasSnafu,
-    NoSuchDataElementTagSnafu, OpenFileSnafu, ParseMetaDataSetSnafu, PrematureEndSnafu,
-    PrepareMetaTableSnafu, PrintDataSetSnafu, ReadFileSnafu, ReadPreambleBytesSnafu,
-    ReadTokenSnafu, Result, UnexpectedTokenSnafu, UnsupportedTransferSyntaxSnafu,
+    AccessByNameError, AccessError, BuildMetaTableSnafu, CreateParserSnafu, CreatePrinterSnafu,
+    DicomObject, FileDicomObject, MissingElementValueSnafu, NoSuchAttributeNameSnafu,
+    NoSuchDataElementAliasSnafu, NoSuchDataElementTagSnafu, OpenFileSnafu, ParseMetaDataSetSnafu,
+    PrematureEndSnafu, PrepareMetaTableSnafu, PrintDataSetSnafu, ReadError, ReadFileSnafu,
+    ReadPreambleBytesSnafu, ReadTokenSnafu, ReadUnsupportedTransferSyntaxSnafu,
+    UnexpectedTokenSnafu, WithMetaError, WriteError,
 };
 use dicom_core::dictionary::{DataDictionary, DictionaryEntry};
 use dicom_core::header::{HasLength, Header};
-use dicom_core::value::{Value, ValueType, C};
+use dicom_core::value::{DataSetSequence, PixelFragmentSequence, Value, ValueType, C};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, StandardDataDictionary};
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
@@ -40,7 +41,9 @@ use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 pub type InMemElement<D = StandardDataDictionary> = DataElement<InMemDicomObject<D>, InMemFragment>;
 
 /// The type of a pixel data fragment.
-pub type InMemFragment = Vec<u8>;
+pub type InMemFragment = dicom_core::value::InMemFragment;
+
+type Result<T, E = AccessError> = std::result::Result<T, E>;
 
 type ParserResult<T> = std::result::Result<T, ParserError>;
 
@@ -84,26 +87,32 @@ where
             .context(NoSuchDataElementTagSnafu { tag })
     }
 
-    fn element_by_name(&self, name: &str) -> Result<Self::Element> {
+    fn element_by_name(&self, name: &str) -> Result<Self::Element, AccessByNameError> {
         let tag = self.lookup_name(name)?;
-        self.element(tag)
+        self.element(tag).map_err(|e| e.into_access_by_name(name))
     }
 }
 
 impl FileDicomObject<InMemDicomObject<StandardDataDictionary>> {
     /// Create a DICOM object by reading from a file.
     ///
-    /// This function assumes the standard file encoding structure: 128-byte
-    /// preamble, file meta group, and the rest of the data set.
-    pub fn open_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the 128-byte preamble is present,
+    /// skipping it if found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
+    pub fn open_file<P: AsRef<Path>>(path: P) -> Result<Self, ReadError> {
         Self::open_file_with_dict(path, StandardDataDictionary)
     }
 
     /// Create a DICOM object by reading from a byte source.
     ///
-    /// This function assumes the standard file encoding structure without the
-    /// preamble: file meta group, followed by the rest of the data set.
-    pub fn from_reader<S>(src: S) -> Result<Self>
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the 128-byte preamble is present,
+    /// skipping it if found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
+    pub fn from_reader<S>(src: S) -> Result<Self, ReadError>
     where
         S: Read,
     {
@@ -153,7 +162,7 @@ impl InMemDicomObject<StandardDataDictionary> {
     /// [`read_dataset_with_ts`]: #method.read_dataset_with_ts
     /// [`read_dataset_with_ts_cs`]: #method.read_dataset_with_ts_cs
     #[inline]
-    pub fn read_dataset<S>(decoder: S) -> Result<Self>
+    pub fn read_dataset<S>(decoder: S) -> Result<Self, ReadError>
     where
         S: StatefulDecode,
     {
@@ -170,7 +179,7 @@ impl InMemDicomObject<StandardDataDictionary> {
         from: S,
         ts: &TransferSyntax,
         cs: SpecificCharacterSet,
-    ) -> Result<Self>
+    ) -> Result<Self, ReadError>
     where
         S: Read,
     {
@@ -184,7 +193,7 @@ impl InMemDicomObject<StandardDataDictionary> {
     /// until _Specific Character Set_ is found in the encoded data,
     /// after which the text decoder will be overriden accordingly.
     #[inline]
-    pub fn read_dataset_with_ts<S>(from: S, ts: &TransferSyntax) -> Result<Self>
+    pub fn read_dataset_with_ts<S>(from: S, ts: &TransferSyntax) -> Result<Self, ReadError>
     where
         S: Read,
     {
@@ -217,23 +226,33 @@ where
 
     /// Create a DICOM object by reading from a file.
     ///
-    /// This function assumes the standard file encoding structure: 128-byte
-    /// preamble, file meta group, and the rest of the data set.
-    pub fn open_file_with_dict<P: AsRef<Path>>(path: P, dict: D) -> Result<Self> {
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the 128-byte preamble is present,
+    /// skipping it when found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
+    pub fn open_file_with_dict<P: AsRef<Path>>(path: P, dict: D) -> Result<Self, ReadError> {
         Self::open_file_with(path, dict, TransferSyntaxRegistry)
     }
 
     /// Create a DICOM object by reading from a file.
     ///
-    /// This function assumes the standard file encoding structure: 128-byte
-    /// preamble, file meta group, and the rest of the data set.
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the 128-byte preamble is present,
+    /// skipping it when found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
     ///
     /// This function allows you to choose a different transfer syntax index,
     /// but its use is only advised when the built-in transfer syntax registry
     /// is insufficient. Otherwise, please use [`open_file_with_dict`] instead.
     ///
     /// [`open_file_with_dict`]: #method.open_file_with_dict
-    pub fn open_file_with<P: AsRef<Path>, R>(path: P, dict: D, ts_index: R) -> Result<Self>
+    pub fn open_file_with<P: AsRef<Path>, R>(
+        path: P,
+        dict: D,
+        ts_index: R,
+    ) -> Result<Self, ReadError>
     where
         P: AsRef<Path>,
         R: TransferSyntaxIndex,
@@ -241,13 +260,33 @@ where
         Self::open_file_with_all_options(path, dict, ts_index, None, ReadPreamble::Auto)
     }
 
+    // detect the presence of a preamble
+    // and provide a better `ReadPreamble` option accordingly
+    fn detect_preamble<S>(reader: &mut BufReader<S>) -> std::io::Result<ReadPreamble>
+    where
+        S: Read,
+    {
+        let buf = reader.fill_buf()?;
+
+        if buf.len() >= 132 && &buf[128..132] == b"DICM" {
+            return Ok(ReadPreamble::Always);
+        }
+
+        if &buf[0..4] == b"DICM" {
+            return Ok(ReadPreamble::Never);
+        }
+
+        // could not detect
+        Ok(ReadPreamble::Auto)
+    }
+
     pub(crate) fn open_file_with_all_options<P: AsRef<Path>, R>(
         path: P,
         dict: D,
         ts_index: R,
         read_until: Option<Tag>,
-        read_preamble: ReadPreamble,
-    ) -> Result<Self>
+        mut read_preamble: ReadPreamble,
+    ) -> Result<Self, ReadError>
     where
         P: AsRef<Path>,
         R: TransferSyntaxIndex,
@@ -255,6 +294,11 @@ where
         let path = path.as_ref();
         let mut file =
             BufReader::new(File::open(path).with_context(|_| OpenFileSnafu { filename: path })?);
+
+        if read_preamble == ReadPreamble::Auto {
+            read_preamble = Self::detect_preamble(&mut file)
+                .with_context(|_| ReadFileSnafu { filename: path })?;
+        }
 
         if read_preamble == ReadPreamble::Auto || read_preamble == ReadPreamble::Always {
             let mut buf = [0u8; 128];
@@ -283,7 +327,7 @@ where
                 )?,
             })
         } else {
-            UnsupportedTransferSyntaxSnafu {
+            ReadUnsupportedTransferSyntaxSnafu {
                 uid: meta.transfer_syntax,
             }
             .fail()
@@ -292,9 +336,12 @@ where
 
     /// Create a DICOM object by reading from a byte source.
     ///
-    /// This function assumes the standard file encoding structure without the
-    /// preamble: file meta group, followed by the rest of the data set.
-    pub fn from_reader_with_dict<S>(src: S, dict: D) -> Result<Self>
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the 128-byte preamble is present,
+    /// skipping it when found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
+    pub fn from_reader_with_dict<S>(src: S, dict: D) -> Result<Self, ReadError>
     where
         S: Read,
     {
@@ -303,15 +350,18 @@ where
 
     /// Create a DICOM object by reading from a byte source.
     ///
-    /// This function assumes the standard file encoding structure without the
-    /// preamble: file meta group, followed by the rest of the data set.
+    /// This function assumes the standard file encoding structure:
+    /// first it automatically detects whether the preamble is present,
+    /// skipping it when found.
+    /// Then it reads the file meta group,
+    /// followed by the rest of the data set.
     ///
     /// This function allows you to choose a different transfer syntax index,
     /// but its use is only advised when the built-in transfer syntax registry
     /// is insufficient. Otherwise, please use [`from_reader_with_dict`] instead.
     ///
     /// [`from_reader_with_dict`]: #method.from_reader_with_dict
-    pub fn from_reader_with<'s, S: 's, R>(src: S, dict: D, ts_index: R) -> Result<Self>
+    pub fn from_reader_with<'s, S: 's, R>(src: S, dict: D, ts_index: R) -> Result<Self, ReadError>
     where
         S: Read,
         R: TransferSyntaxIndex,
@@ -324,13 +374,17 @@ where
         dict: D,
         ts_index: R,
         read_until: Option<Tag>,
-        read_preamble: ReadPreamble,
-    ) -> Result<Self>
+        mut read_preamble: ReadPreamble,
+    ) -> Result<Self, ReadError>
     where
         S: Read,
         R: TransferSyntaxIndex,
     {
         let mut file = BufReader::new(src);
+
+        if read_preamble == ReadPreamble::Auto {
+            read_preamble = Self::detect_preamble(&mut file).context(ReadPreambleBytesSnafu)?;
+        }
 
         if read_preamble == ReadPreamble::Always {
             // skip preamble
@@ -356,7 +410,7 @@ where
             )?;
             Ok(FileDicomObject { meta, obj })
         } else {
-            UnsupportedTransferSyntaxSnafu {
+            ReadUnsupportedTransferSyntaxSnafu {
                 uid: meta.transfer_syntax,
             }
             .fail()
@@ -421,7 +475,7 @@ where
     /// Read an object from a source,
     /// using the given decoder
     /// and the given dictionary for name lookup.
-    pub fn read_dataset_with_dict<S>(decoder: S, dict: D) -> Result<Self>
+    pub fn read_dataset_with_dict<S>(decoder: S, dict: D) -> Result<Self, ReadError>
     where
         S: StatefulDecode,
         D: DataDictionary,
@@ -433,7 +487,11 @@ where
     /// Read an object from a source,
     /// using the given data dictionary and transfer syntax.
     #[inline]
-    pub fn read_dataset_with_dict_ts<S>(from: S, dict: D, ts: &TransferSyntax) -> Result<Self>
+    pub fn read_dataset_with_dict_ts<S>(
+        from: S,
+        dict: D,
+        ts: &TransferSyntax,
+    ) -> Result<Self, ReadError>
     where
         S: Read,
         D: DataDictionary,
@@ -453,7 +511,7 @@ where
         dict: D,
         ts: &TransferSyntax,
         cs: SpecificCharacterSet,
-    ) -> Result<Self>
+    ) -> Result<Self, ReadError>
     where
         S: Read,
         D: DataDictionary,
@@ -501,7 +559,7 @@ where
     /// An error is returned if the element does not exist.
     /// For an alternative to this behavior,
     /// see [`element_by_name_opt`](InMemDicomObject::element_by_name_opt).
-    pub fn element_by_name(&self, name: &str) -> Result<&InMemElement<D>> {
+    pub fn element_by_name(&self, name: &str) -> Result<&InMemElement<D>, AccessByNameError> {
         let tag = self.lookup_name(name)?;
         self.entries
             .get(&tag)
@@ -515,11 +573,10 @@ where
     ///
     /// If the element does not exist,
     /// `None` is returned.
-    pub fn element_opt(&self, tag: Tag) -> Result<Option<&InMemElement<D>>> {
+    pub fn element_opt(&self, tag: Tag) -> Result<Option<&InMemElement<D>>, AccessError> {
         match self.element(tag) {
             Ok(e) => Ok(Some(e)),
-            Err(super::Error::NoSuchDataElementTag { .. }) => Ok(None),
-            Err(e) => Err(e),
+            Err(super::AccessError::NoSuchDataElementTag { .. }) => Ok(None),
         }
     }
 
@@ -541,10 +598,13 @@ where
     /// If the attribute is known in advance,
     /// using [`element_opt`](InMemDicomObject::element_opt)
     /// with a tag constant is preferred.
-    pub fn element_by_name_opt(&self, name: &str) -> Result<Option<&InMemElement<D>>> {
+    pub fn element_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<&InMemElement<D>>, AccessByNameError> {
         match self.element_by_name(name) {
             Ok(e) => Ok(Some(e)),
-            Err(super::Error::NoSuchDataElementAlias { .. }) => Ok(None),
+            Err(AccessByNameError::NoSuchDataElementAlias { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -558,26 +618,41 @@ where
     /// Insert a data element to the object, replacing (and returning) any
     /// previous element of the same attribute.
     pub fn put_element(&mut self, elt: InMemElement<D>) -> Option<InMemElement<D>> {
+        self.len = Length::UNDEFINED;
         self.entries.insert(elt.tag(), elt)
     }
 
     /// Remove a DICOM element by its tag,
     /// reporting whether it was present.
     pub fn remove_element(&mut self, tag: Tag) -> bool {
-        self.entries.remove(&tag).is_some()
+        if self.entries.remove(&tag).is_some() {
+            self.len = Length::UNDEFINED;
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove a DICOM element by its keyword,
     /// reporting whether it was present.
-    pub fn remove_element_by_name(&mut self, name: &str) -> Result<bool> {
+    pub fn remove_element_by_name(&mut self, name: &str) -> Result<bool, AccessByNameError> {
         let tag = self.lookup_name(name)?;
-        Ok(self.entries.remove(&tag).is_some())
+        Ok(self.entries.remove(&tag).is_some()).map(|removed| {
+            if removed {
+                self.len = Length::UNDEFINED;
+            }
+            removed
+        })
     }
 
     /// Remove and return a particular DICOM element by its tag.
     pub fn take_element(&mut self, tag: Tag) -> Result<InMemElement<D>> {
         self.entries
             .remove(&tag)
+            .map(|e| {
+                self.len = Length::UNDEFINED;
+                e
+            })
             .context(NoSuchDataElementTagSnafu { tag })
     }
 
@@ -585,14 +660,24 @@ where
     /// if it is present,
     /// returns `None` otherwise.
     pub fn take(&mut self, tag: Tag) -> Option<InMemElement<D>> {
-        self.entries.remove(&tag)
+        self.entries.remove(&tag).map(|e| {
+            self.len = Length::UNDEFINED;
+            e
+        })
     }
 
     /// Remove and return a particular DICOM element by its name.
-    pub fn take_element_by_name(&mut self, name: &str) -> Result<InMemElement<D>> {
+    pub fn take_element_by_name(
+        &mut self,
+        name: &str,
+    ) -> Result<InMemElement<D>, AccessByNameError> {
         let tag = self.lookup_name(name)?;
         self.entries
             .remove(&tag)
+            .map(|e| {
+                self.len = Length::UNDEFINED;
+                e
+            })
             .with_context(|| NoSuchDataElementAliasSnafu {
                 tag,
                 alias: name.to_string(),
@@ -606,6 +691,7 @@ where
     /// and those for which `f(&element)` returns `false` are removed.
     pub fn retain(&mut self, mut f: impl FnMut(&InMemElement<D>) -> bool) {
         self.entries.retain(|_, elem| f(elem));
+        self.len = Length::UNDEFINED;
     }
 
     /// Apply the given attribute operation on this object.
@@ -635,7 +721,7 @@ where
     /// // apply patient name change
     /// obj.apply(AttributeOp {
     ///   tag: tags::PATIENT_NAME,
-    ///   action: AttributeAction::ReplaceStr("Patient^Anonymous".into())
+    ///   action: AttributeAction::SetStr("Patient^Anonymous".into())
     /// })?;
     ///
     /// assert_eq!(
@@ -657,6 +743,7 @@ where
                     let vr = e.vr();
                     // replace element
                     *e = DataElement::empty(tag, vr);
+                    self.len = Length::UNDEFINED;
                 }
                 Ok(())
             }
@@ -670,13 +757,39 @@ where
                 }
                 Ok(())
             }
-            AttributeAction::Replace(new_value) => {
+            AttributeAction::Set(new_value) => {
                 self.apply_change_value_impl(tag, new_value);
                 Ok(())
             }
-            AttributeAction::ReplaceStr(string) => {
+            AttributeAction::SetStr(string) => {
                 let new_value = PrimitiveValue::from(&*string);
                 self.apply_change_value_impl(tag, new_value);
+                Ok(())
+            }
+            AttributeAction::SetIfMissing(new_value) => {
+                if self.get(tag).is_none() {
+                    self.apply_change_value_impl(tag, new_value);
+                }
+                Ok(())
+            }
+            AttributeAction::SetStrIfMissing(string) => {
+                if self.get(tag).is_none() {
+                    let new_value = PrimitiveValue::from(&*string);
+                    self.apply_change_value_impl(tag, new_value);
+                }
+                Ok(())
+            }
+            AttributeAction::Replace(new_value) => {
+                if self.get(op.tag).is_some() {
+                    self.apply_change_value_impl(tag, new_value);
+                }
+                Ok(())
+            }
+            AttributeAction::ReplaceStr(string) => {
+                if self.get(op.tag).is_some() {
+                    let new_value = PrimitiveValue::from(&*string);
+                    self.apply_change_value_impl(tag, new_value);
+                }
                 Ok(())
             }
             AttributeAction::PushStr(string) => self.apply_push_str_impl(tag, string),
@@ -694,6 +807,7 @@ where
         if let Some(e) = self.entries.get_mut(&tag) {
             let vr = e.vr();
             *e = DataElement::new(tag, vr, new_value);
+            self.len = Length::UNDEFINED;
         } else {
             // infer VR from tag
             let vr = dicom_dictionary_std::StandardDataDictionary
@@ -717,12 +831,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -750,12 +864,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -783,12 +897,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -816,12 +930,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -849,12 +963,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -882,12 +996,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -915,12 +1029,12 @@ where
                     Ok(())
                 }
 
-                Value::PixelSequence { .. } => IncompatibleTypesSnafu {
+                Value::PixelSequence(..) => IncompatibleTypesSnafu {
                     kind: ValueType::PixelSequence,
                 }
                 .fail(),
-                Value::Sequence { .. } => IncompatibleTypesSnafu {
-                    kind: ValueType::Item,
+                Value::Sequence(..) => IncompatibleTypesSnafu {
+                    kind: ValueType::DataSetSequence,
                 }
                 .fail(),
             }
@@ -949,7 +1063,7 @@ where
     ///
     /// [`write_dataset_with_ts`]: #method.write_dataset_with_ts
     /// [`write_dataset_with_ts_cs`]: #method.write_dataset_with_ts_cs
-    pub fn write_dataset<W, E>(&self, to: W, encoder: E) -> Result<()>
+    pub fn write_dataset<W, E>(&self, to: W, encoder: E) -> Result<(), WriteError>
     where
         W: Write,
         E: EncodeTo<W>,
@@ -976,7 +1090,7 @@ where
         to: W,
         ts: &TransferSyntax,
         cs: SpecificCharacterSet,
-    ) -> Result<()>
+    ) -> Result<(), WriteError>
     where
         W: Write,
     {
@@ -998,7 +1112,7 @@ where
     /// The default character set is assumed
     /// until the _Specific Character Set_ is found in the data set,
     /// after which the text encoder is overridden accordingly.
-    pub fn write_dataset_with_ts<W>(&self, to: W, ts: &TransferSyntax) -> Result<()>
+    pub fn write_dataset_with_ts<W>(&self, to: W, ts: &TransferSyntax) -> Result<(), WriteError>
     where
         W: Write,
     {
@@ -1021,9 +1135,12 @@ where
     /// will be filled in with the contents of the object,
     /// if the attribute _SOP Instance UID_  is present.
     /// A complete file meta group should still provide
-    /// the media storage SOP class UID and transfer syntax.
-    pub fn with_meta(self, mut meta: FileMetaTableBuilder) -> Result<FileDicomObject<Self>> {
-        if let Some(elem) = self.element_opt(tags::SOP_INSTANCE_UID)? {
+    /// the media storage SOP class UID and transfer syntax.0
+    pub fn with_meta(
+        self,
+        mut meta: FileMetaTableBuilder,
+    ) -> Result<FileDicomObject<Self>, WithMetaError> {
+        if let Some(elem) = self.get(tags::SOP_INSTANCE_UID) {
             meta = meta.media_storage_sop_instance_uid(
                 elem.value().to_str().context(PrepareMetaTableSnafu)?,
             );
@@ -1053,7 +1170,7 @@ where
         in_item: bool,
         len: Length,
         read_until: Option<Tag>,
-    ) -> Result<Self>
+    ) -> Result<Self, ReadError>
     where
         I: Iterator<Item = ParserResult<DataToken>>,
     {
@@ -1107,7 +1224,7 @@ where
                         tag,
                         VR::SQ,
                         len,
-                        Value::Sequence { items, size: len },
+                        Value::Sequence(DataSetSequence::new(items, len)),
                     )
                 }
                 DataToken::ItemEnd if in_item => {
@@ -1124,7 +1241,9 @@ where
 
     /// Build an encapsulated pixel data by collecting all fragments into an
     /// in-memory DICOM value.
-    fn build_encapsulated_data<I>(dataset: I) -> Result<Value<InMemDicomObject<D>, InMemFragment>>
+    fn build_encapsulated_data<I>(
+        dataset: I,
+    ) -> Result<Value<InMemDicomObject<D>, InMemFragment>, ReadError>
     where
         I: Iterator<Item = ParserResult<DataToken>>,
     {
@@ -1171,10 +1290,10 @@ where
             }
         }
 
-        Ok(Value::PixelSequence {
+        Ok(Value::PixelSequence(PixelFragmentSequence::new(
+            offset_table.unwrap_or_default(),
             fragments,
-            offset_table: offset_table.unwrap_or_default().into(),
-        })
+        )))
     }
 
     /// Build a DICOM sequence by consuming a data set parser.
@@ -1183,7 +1302,7 @@ where
         _len: Length,
         dataset: &mut I,
         dict: &D,
-    ) -> Result<C<InMemDicomObject<D>>>
+    ) -> Result<C<InMemDicomObject<D>>, ReadError>
     where
         I: Iterator<Item = ParserResult<DataToken>>,
     {
@@ -1210,7 +1329,7 @@ where
         PrematureEndSnafu.fail()
     }
 
-    fn lookup_name(&self, name: &str) -> Result<Tag> {
+    fn lookup_name(&self, name: &str) -> Result<Tag, AccessByNameError> {
         self.dict
             .by_name(name)
             .context(NoSuchAttributeNameSnafu { name })
@@ -1277,6 +1396,7 @@ impl<D> Extend<InMemElement<D>> for InMemDicomObject<D> {
     where
         I: IntoIterator<Item = InMemElement<D>>,
     {
+        self.len = Length::UNDEFINED;
         self.entries.extend(iter.into_iter().map(|e| (e.tag(), e)))
     }
 }
@@ -1285,7 +1405,7 @@ impl<D> Extend<InMemElement<D>> for InMemDicomObject<D> {
 mod tests {
 
     use super::*;
-    use crate::{meta::FileMetaTableBuilder, open_file, Error};
+    use crate::{meta::FileMetaTableBuilder, open_file};
     use byteordered::Endianness;
     use dicom_core::chrono::FixedOffset;
     use dicom_core::value::{DicomDate, DicomDateTime, DicomTime, PrimitiveValue};
@@ -1733,7 +1853,7 @@ mod tests {
         assert_eq!(elem1, another_patient_name);
         assert!(matches!(
             obj.take_element(Tag(0x0010, 0x0010)),
-            Err(Error::NoSuchDataElementTag {
+            Err(AccessError::NoSuchDataElementTag {
                 tag: Tag(0x0010, 0x0010),
                 ..
             })
@@ -1753,7 +1873,7 @@ mod tests {
         assert_eq!(elem1, another_patient_name);
         assert!(matches!(
             obj.take_element_by_name("PatientName"),
-            Err(Error::NoSuchDataElementAlias {
+            Err(AccessByNameError::NoSuchDataElementAlias {
                 tag: Tag(0x0010, 0x0010),
                 alias,
                 ..
@@ -1968,10 +2088,10 @@ mod tests {
             DataElement::new(
                 Tag(0x0018, 0x6011),
                 VR::SQ,
-                Value::Sequence {
-                    items: smallvec![obj_1, obj_2],
-                    size: Length::UNDEFINED,
-                },
+                Value::from(DataSetSequence::new(
+                    smallvec![obj_1, obj_2],
+                    Length::UNDEFINED,
+                )),
             ),
             DataElement::new(Tag(0x0020, 0x4000), VR::LT, Value::Primitive("TEST".into())),
         ]);
@@ -2047,10 +2167,10 @@ mod tests {
             DataElement::new(
                 Tag(0x0018, 0x6011),
                 VR::SQ,
-                Value::Sequence {
-                    items: smallvec![obj_1, obj_2],
-                    size: Length::UNDEFINED,
-                },
+                Value::from(DataSetSequence::new(
+                    smallvec![obj_1, obj_2],
+                    Length::UNDEFINED,
+                )),
             ),
             DataElement::new(Tag(0x0020, 0x4000), VR::LT, Value::Primitive("TEST".into())),
         ]);
@@ -2108,10 +2228,10 @@ mod tests {
         let gt_obj = InMemDicomObject::from_element_iter(vec![DataElement::new(
             Tag(0x7fe0, 0x0010),
             VR::OB,
-            Value::PixelSequence {
-                fragments: smallvec![vec![0x33; 32]],
-                offset_table: Default::default(),
-            },
+            Value::from(PixelFragmentSequence::new_fragments(smallvec![vec![
+                0x33;
+                32
+            ]])),
         )]);
 
         let tokens: Vec<_> = vec![
@@ -2143,10 +2263,10 @@ mod tests {
         let main_obj = InMemDicomObject::from_element_iter(vec![DataElement::new(
             Tag(0x7fe0, 0x0010),
             VR::OB,
-            Value::PixelSequence {
-                fragments: smallvec![vec![0x33; 32]],
-                offset_table: Default::default(),
-            },
+            Value::from(PixelFragmentSequence::new_fragments(smallvec![vec![
+                0x33;
+                32
+            ]])),
         )]);
 
         let tokens: Vec<_> = main_obj.into_tokens().collect();
@@ -2227,8 +2347,27 @@ mod tests {
             assert_eq!(obj.get(tags::STUDY_DESCRIPTION), None);
         }
         {
-            // replace string
             let mut obj = base_obj.clone();
+
+            // set if missing does nothing
+            // on an existing string
+            let op = AttributeOp {
+                tag: tags::INSTITUTION_NAME,
+                action: AttributeAction::SetIfMissing("Nope Hospital".into()),
+            };
+
+            obj.apply(op).unwrap();
+
+            assert_eq!(
+                obj.get(tags::INSTITUTION_NAME),
+                Some(&DataElement::new(
+                    tags::INSTITUTION_NAME,
+                    VR::LO,
+                    PrimitiveValue::from("Test Hospital")
+                ))
+            );
+
+            // replace string
             let op = AttributeOp {
                 tag: tags::INSTITUTION_NAME,
                 action: AttributeAction::ReplaceStr("REMOVED".into()),
@@ -2242,6 +2381,53 @@ mod tests {
                     tags::INSTITUTION_NAME,
                     VR::LO,
                     PrimitiveValue::from("REMOVED")
+                ))
+            );
+
+            // replacing a non-existing attribute
+            // does nothing
+            let op = AttributeOp {
+                tag: tags::REQUESTING_PHYSICIAN,
+                action: AttributeAction::ReplaceStr("Doctor^Anonymous".into()),
+            };
+
+            obj.apply(op).unwrap();
+
+            assert_eq!(obj.get(tags::REQUESTING_PHYSICIAN), None);
+
+            // but DetIfMissing works
+            let op = AttributeOp {
+                tag: tags::REQUESTING_PHYSICIAN,
+                action: AttributeAction::SetStrIfMissing("Doctor^Anonymous".into()),
+            };
+
+            obj.apply(op).unwrap();
+
+            assert_eq!(
+                obj.get(tags::REQUESTING_PHYSICIAN),
+                Some(&DataElement::new(
+                    tags::REQUESTING_PHYSICIAN,
+                    VR::PN,
+                    PrimitiveValue::from("Doctor^Anonymous")
+                ))
+            );
+        }
+        {
+            // reset string
+            let mut obj = base_obj.clone();
+            let op = AttributeOp {
+                tag: tags::REQUESTING_PHYSICIAN,
+                action: AttributeAction::SetStr("Doctor^Anonymous".into()),
+            };
+
+            obj.apply(op).unwrap();
+
+            assert_eq!(
+                obj.get(tags::REQUESTING_PHYSICIAN),
+                Some(&DataElement::new(
+                    tags::REQUESTING_PHYSICIAN,
+                    VR::PN,
+                    PrimitiveValue::from("Doctor^Anonymous")
                 ))
             );
         }
@@ -2265,5 +2451,183 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn inmem_obj_reset_defined_length() {
+        let mut entries: BTreeMap<Tag, InMemElement<StandardDataDictionary>> = BTreeMap::new();
+
+        let patient_name =
+            DataElement::new(tags::PATIENT_NAME, VR::CS, PrimitiveValue::from("Doe^John"));
+
+        let study_description = DataElement::new(
+            tags::STUDY_DESCRIPTION,
+            VR::LO,
+            PrimitiveValue::from("Test study"),
+        );
+
+        entries.insert(tags::PATIENT_NAME, patient_name.clone());
+
+        // create object and force an arbitrary defined Length value
+        let obj = InMemDicomObject::<StandardDataDictionary> {
+            entries,
+            dict: StandardDataDictionary,
+            len: Length(1),
+        };
+
+        assert!(obj.length().is_defined());
+
+        let mut o = obj.clone();
+        o.put_element(study_description);
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.remove_element(tags::PATIENT_NAME);
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.remove_element_by_name("PatientName").unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.take_element(tags::PATIENT_NAME).unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.take_element_by_name("PatientName").unwrap();
+        assert!(o.length().is_undefined());
+
+        // resets Length even when retain does not make any changes
+        let mut o = obj.clone();
+        o.retain(|e| e.tag() == tags::PATIENT_NAME);
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::Remove,
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::Empty,
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::SetVr(VR::IS),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::Set(dicom_value!(Str, "Unknown")),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::SetStr("Patient^Anonymous".into()),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_AGE,
+            action: AttributeAction::SetIfMissing(dicom_value!(75)),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_ADDRESS,
+            action: AttributeAction::SetStrIfMissing("Chicago".into()),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::Replace(dicom_value!(Str, "Unknown")),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::ReplaceStr("Unknown".into()),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushStr("^Prof".into()),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushI32(-16),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushU32(16),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushI16(-16),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushU16(16),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushF32(16.16),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
+
+        let mut o = obj.clone();
+        o.apply(AttributeOp {
+            tag: tags::PATIENT_NAME,
+            action: AttributeAction::PushF64(16.1616),
+        })
+        .unwrap();
+        assert!(o.length().is_undefined());
     }
 }

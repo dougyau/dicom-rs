@@ -752,68 +752,6 @@ impl PrimitiveValue {
         }
     }
 
-    /// Convert the primitive value into a clean string representation,
-    /// removing unwanted whitespaces.
-    ///
-    /// Leading whitespaces are preserved and are only removed at the end of a string
-    ///
-    /// String values already encoded with the `Str` and `Strs` variants
-    /// are provided as is without the unwanted whitespaces.
-    /// In the case of `Strs`, the strings are first cleaned from whitespaces
-    /// and then joined together with a backslash (`'\\'`).
-    /// All other type variants are first converted to a clean string,
-    /// then joined together with a backslash.
-    ///
-    /// **Note:**
-    /// As the process of reading a DICOM value
-    /// may not always preserve its original nature,
-    /// it is not guaranteed that `to_clean_str()` returns a string with
-    /// the exact same byte sequence as the one originally found
-    /// at the source of the value,
-    /// even for the string variants.
-    /// Therefore, this method is not reliable
-    /// for compliant DICOM serialization.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use dicom_core::dicom_value;
-    /// # use dicom_core::value::{C, PrimitiveValue, DicomDate};
-    /// # use smallvec::smallvec;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// assert_eq!(
-    ///     dicom_value!(Str, "Smith^John ").to_clean_str(),
-    ///     "Smith^John",
-    /// );
-    /// assert_eq!(
-    ///     dicom_value!(Str, " Smith^John").to_clean_str(),
-    ///     " Smith^John",
-    /// );
-    /// assert_eq!(
-    ///     dicom_value!(Date, DicomDate::from_ymd(2014, 10, 12)?).to_clean_str(),
-    ///     "2014-10-12",
-    /// );
-    /// assert_eq!(
-    ///     dicom_value!(Strs, [
-    ///         "DERIVED\0",
-    ///         "PRIMARY",
-    ///         " WHOLE BODY",
-    ///         "EMISSION",
-    ///     ])
-    ///     .to_clean_str(),
-    ///     "DERIVED\\PRIMARY\\ WHOLE BODY\\EMISSION",
-    /// );
-    /// Ok(())
-    /// }
-    /// ```
-    #[deprecated(
-        note = "`to_clean_str()` is now deprecated in favour of using `to_str()` directly. 
-        `to_raw_str()` replaces the old functionality of `to_str()` and maintains all trailing whitespace."
-    )]
-    pub fn to_clean_str(&self) -> Cow<str> {
-        self.to_str()
-    }
-
     /// Retrieve this DICOM value as raw bytes.
     ///
     /// Binary numeric values are returned with a reinterpretation
@@ -2126,7 +2064,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(super::deserialize::parse_date)
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -2289,7 +2226,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(|s| super::deserialize::parse_date_partial(s).map(|(date, _rest)| date))
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -2472,7 +2408,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(|s| super::deserialize::parse_time(s).map(|(date, _rest)| date))
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -2670,7 +2605,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(|s| super::deserialize::parse_time_partial(s).map(|(date, _rest)| date))
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -2893,7 +2827,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(|s| super::deserialize::parse_datetime(s, default_offset))
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -3058,7 +2991,6 @@ impl PrimitiveValue {
                 }),
             PrimitiveValue::U8(bytes) => trim_last_whitespace(bytes)
                 .split(|c| *c == b'\\')
-                .into_iter()
                 .map(|s| super::deserialize::parse_datetime_partial(s, default_offset))
                 .collect::<Result<Vec<_>, _>>()
                 .context(ParseDateSnafu)
@@ -3340,7 +3272,7 @@ impl PrimitiveValue {
     /// ```
     pub fn to_person_name(&self) -> Result<PersonName<'_>, ConvertValueError> {
         match self {
-            PrimitiveValue::Str(s) => Ok(PersonName::from_str(s)),
+            PrimitiveValue::Str(s) => Ok(PersonName::from_text(s)),
             PrimitiveValue::Strs(s) => s.first().map_or_else(
                 || {
                     Err(ConvertValueError {
@@ -3349,7 +3281,7 @@ impl PrimitiveValue {
                         cause: None,
                     })
                 },
-                |s| Ok(PersonName::from_str(s)),
+                |s| Ok(PersonName::from_text(s)),
             ),
             _ => Err(ConvertValueError {
                 requested: "PersonName",
@@ -4255,14 +4187,15 @@ impl PartialEq<&str> for PrimitiveValue {
 
 /// An enum representing an abstraction of a DICOM element's data value type.
 /// This should be the equivalent of `PrimitiveValue` without the content,
-/// plus the `Item` and `PixelSequence` entries.
+/// plus the `DataSetSequence` and `PixelSequence` entries.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ValueType {
     /// No data. Used for any value of length 0.
     Empty,
 
-    /// An item. Used for elements in a SQ, regardless of content.
-    Item,
+    /// A data set sequence.
+    /// Used for values with the SQ representation when not empty.
+    DataSetSequence,
 
     /// An item. Used for the values of encapsulated pixel data.
     PixelSequence,

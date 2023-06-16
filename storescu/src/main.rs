@@ -1,5 +1,5 @@
 use clap::Parser;
-use dicom_core::{dicom_value, header::Tag, smallvec, DataElement, PrimitiveValue, VR};
+use dicom_core::{dicom_value, header::Tag, DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
 use dicom_encoding::transfer_syntax;
 use dicom_object::{mem::InMemDicomObject, open_file, StandardDataDictionary};
@@ -9,7 +9,6 @@ use dicom_ul::{
     pdu::{PDataValue, PDataValueType, Pdu},
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use smallvec::smallvec;
 use snafu::prelude::*;
 use snafu::{Report, Whatever};
 use std::collections::HashSet;
@@ -76,7 +75,7 @@ enum Error {
     },
 
     /// Could not construct DICOM command
-    CreateCommand { source: dicom_object::Error },
+    CreateCommand { source: dicom_object::WriteError },
 
     #[snafu(whatever, display("{}", message))]
     Other {
@@ -179,7 +178,7 @@ fn run() -> Result<(), Error> {
         info!("Association established");
     }
 
-    for mut file in &mut dicom_files {
+    for file in &mut dicom_files {
         // TODO(#106) transfer syntax conversion is currently not supported
         let r: Result<_, Error> = check_presentation_contexts(file, scu.presentation_contexts())
             .whatever_context::<_, _>("Could not choose a transfer syntax");

@@ -1,5 +1,5 @@
 use clap::Parser;
-use dicom_core::{dicom_value, smallvec};
+use dicom_core::dicom_value;
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
 use dicom_dump::DumpOptions;
@@ -12,7 +12,6 @@ use dicom_ul::{
     pdu::{PDataValue, PDataValueType},
 };
 use query::parse_queries;
-use smallvec::smallvec;
 use snafu::prelude::*;
 use std::io::{stderr, Read};
 use std::path::PathBuf;
@@ -69,10 +68,10 @@ enum Error {
     },
 
     /// Could not construct DICOM command
-    CreateCommand { source: dicom_object::Error },
+    CreateCommand { source: dicom_object::ReadError },
 
     /// Could not read DICOM command
-    ReadCommand { source: dicom_object::Error },
+    ReadCommand { source: dicom_object::ReadError },
 
     /// Could not dump DICOM output
     DumpOutput { source: std::io::Error },

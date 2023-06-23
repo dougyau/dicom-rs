@@ -1,8 +1,36 @@
-use crate::value::{PixelFragmentSequence, C};
+//! Handle pixel encapsulation into fragments
+use crate::value::{InMemFragment, PixelFragmentSequence, C};
 
+/// Represents the fragments of a single frame. [PixelFragmentSequence] can be generated from a list
+/// of [Fragments]. In case of multi frame a list of frames composed by 1 fragment is expected.
+///
+/// The frames can be independently processed, so parallel execution is possible.
+///
+/// # Example
+/// ```
+/// use dicom_core::{DataElement, Tag};
+/// use dicom_core::header::EmptyObject;
+/// use dicom_core::value::Value::PixelSequence;
+/// use dicom_core::value::fragments::Fragments;
+/// use dicom_core::value::InMemFragment;
+/// use dicom_core::VR::OB;
+///
+/// // Frames are represented as Vec<Vec<u8>>
+/// // Single 512x512 frame
+/// let frames = vec![vec![0; 262144]];
+/// let fragments = frames
+///     .into_iter()
+///     .map(|frame| Fragments::new(frame, 0))
+///     .collect::<Vec<Fragments>>();
+///
+/// let element = DataElement::new(Tag(0x7FE0, 0x0008), OB, PixelSequence::<EmptyObject, InMemFragment>(fragments.into()));
+/// ```
+///
+/// From this last example, it is possible to extend it to implement a pipeline, and even use rayon
+/// process the frames.
 #[derive(Debug)]
 pub struct Fragments {
-    fragments: Vec<Vec<u8>>,
+    fragments: Vec<InMemFragment>,
 }
 
 impl Fragments {
@@ -32,7 +60,7 @@ impl Fragments {
         let fragments = data
             .chunks_exact(fragment_size as usize)
             .map(|fragment| fragment.to_vec())
-            .collect::<Vec<Vec<u8>>>();
+            .collect::<Vec<InMemFragment>>();
 
         Fragments { fragments }
     }
@@ -52,7 +80,7 @@ impl Fragments {
     }
 }
 
-impl From<Vec<Fragments>> for PixelFragmentSequence<Vec<u8>> {
+impl From<Vec<Fragments>> for PixelFragmentSequence<InMemFragment> {
     fn from(value: Vec<Fragments>) -> Self {
         let mut offset_table = C::with_capacity(value.len() + 1);
         offset_table.push(0u32);
@@ -77,5 +105,68 @@ impl From<Vec<Fragments>> for PixelFragmentSequence<Vec<u8>> {
             offset_table,
             fragments: C::from_vec(fragments),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::value::fragments::Fragments;
+
+    #[test]
+    fn test_fragment_frame() {
+        let fragment = Fragments::new(vec![150, 164, 200], 0);
+        assert_eq!(fragment.fragments.len(), 1, "1 fragment should be present");
+        assert_eq!(
+            fragment.fragments[0].len(),
+            4,
+            "The fragment size should be 4"
+        );
+        assert_eq!(
+            fragment.fragments[0],
+            vec![150, 164, 200, 0],
+            "The data should be 0 padded"
+        );
+
+        let fragment = Fragments::new(vec![150, 164, 200, 222], 4);
+        assert_eq!(fragment.fragments.len(), 1, "1 fragment should be present");
+        assert_eq!(
+            fragment.fragments[0].len(),
+            4,
+            "The fragment size should be 4"
+        );
+        assert_eq!(
+            fragment.fragments[0],
+            vec![150, 164, 200, 222],
+            "The data should be what was sent"
+        );
+
+        let fragment = Fragments::new(vec![150, 164, 200, 222], 2);
+        assert_eq!(fragment.fragments.len(), 2, "2 fragments should be present");
+        assert_eq!(fragment.fragments[0].len(), 2);
+        assert_eq!(fragment.fragments[1].len(), 2);
+        assert_eq!(fragment.fragments[0], vec![150, 164]);
+        assert_eq!(fragment.fragments[1], vec![200, 222]);
+
+        let fragment = Fragments::new(vec![150, 164, 200], 1);
+        assert_eq!(
+            fragment.fragments.len(),
+            2,
+            "2 fragments should be present as fragment_size < 2"
+        );
+        assert_eq!(fragment.fragments[0].len(), 2);
+        assert_eq!(fragment.fragments[0], vec![150, 164]);
+        assert_eq!(fragment.fragments[1].len(), 2);
+        assert_eq!(fragment.fragments[1], vec![200, 0]);
+
+        let fragment = Fragments::new(vec![150, 164, 200, 222], 1);
+        assert_eq!(
+            fragment.fragments.len(),
+            2,
+            "2 fragments should be present as fragment_size < 2"
+        );
+        assert_eq!(fragment.fragments[0].len(), 2);
+        assert_eq!(fragment.fragments[0], vec![150, 164]);
+        assert_eq!(fragment.fragments[1].len(), 2);
+        assert_eq!(fragment.fragments[1], vec![200, 222]);
     }
 }

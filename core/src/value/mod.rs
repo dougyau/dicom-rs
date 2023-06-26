@@ -154,6 +154,14 @@ impl<I, P> Value<I, P> {
         }
     }
 
+    /// Gets a mutable reference to the primitive value.
+    pub fn primitive_mut(&mut self) -> Option<&mut PrimitiveValue> {
+        match self {
+            Value::Primitive(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Gets a reference to the items of a sequence.
     ///
     /// Returns `None` if the value is not a data set sequence.
@@ -164,12 +172,32 @@ impl<I, P> Value<I, P> {
         }
     }
 
+    /// Gets a mutable reference to the items of a sequence.
+    ///
+    /// Returns `None` if the value is not a data set sequence.
+    pub fn items_mut(&mut self) -> Option<&mut C<I>> {
+        match self {
+            Value::Sequence(v) => Some(v.items_mut()),
+            _ => None,
+        }
+    }
+
     /// Gets a reference to the fragments of a pixel data sequence.
     ///
     /// Returns `None` if the value is not a pixel data sequence.
     pub fn fragments(&self) -> Option<&[P]> {
         match self {
             Value::PixelSequence(v) => Some(v.fragments()),
+            _ => None,
+        }
+    }
+
+    /// Gets a mutable reference to the fragments of a pixel data sequence.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn fragments_mut(&mut self) -> Option<&mut C<P>> {
+        match self {
+            Value::PixelSequence(v) => Some(v.fragments_mut()),
             _ => None,
         }
     }
@@ -210,6 +238,30 @@ impl<I, P> Value<I, P> {
             Value::PixelSequence(v) => Some(v.offset_table()),
             _ => None,
         }
+    }
+
+    /// Gets a mutable reference to the encapsulated pixel data's offset table.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn offset_table_mut(&mut self) -> Option<&mut C<u32>> {
+        match self {
+            Value::PixelSequence(v) => Some(v.offset_table_mut()),
+            _ => None,
+        }
+    }
+}
+
+impl<I, P> From<&str> for Value<I, P> {
+    /// Converts a string into a primitive textual value.
+    fn from(value: &str) -> Self {
+        Value::Primitive(PrimitiveValue::from(value))
+    }
+}
+
+impl<I, P> From<String> for Value<I, P> {
+    /// Converts a string into a primitive textual value.
+    fn from(value: String) -> Self {
+        Value::Primitive(PrimitiveValue::from(value))
     }
 }
 
@@ -743,10 +795,26 @@ impl<I> DataSetSequence<I> {
         }
     }
 
+    /// Construct an empty DICOM data sequence,
+    /// with the length explicitly defined to zero.
+    #[inline]
+    pub fn empty() -> Self {
+        DataSetSequence {
+            items: Default::default(),
+            length: Length(0),
+        }
+    }
+
     /// Gets a reference to the items of a sequence.
     #[inline]
     pub fn items(&self) -> &[I] {
         &self.items
+    }
+
+    /// Gets a mutable reference to the items of a sequence.
+    #[inline]
+    pub fn items_mut(&mut self) -> &mut C<I> {
+        &mut self.items
     }
 
     /// Obtain the number of items in the sequence.
@@ -792,6 +860,46 @@ impl<I> DicomValueType for DataSetSequence<I> {
     }
 }
 
+impl<I> From<Vec<I>> for DataSetSequence<I> {
+    /// Converts a vector of items
+    /// into a data set sequence with an undefined length.
+    #[inline]
+    fn from(items: Vec<I>) -> Self {
+        DataSetSequence {
+            items: items.into(),
+            length: Length::UNDEFINED,
+        }
+    }
+}
+
+impl<A, I> From<SmallVec<A>> for DataSetSequence<I>
+where
+    A: smallvec::Array<Item = I>,
+    C<I>: From<SmallVec<A>>,
+{
+    /// Converts a smallvec of items
+    /// into a data set sequence with an undefined length.
+    #[inline]
+    fn from(items: SmallVec<A>) -> Self {
+        DataSetSequence {
+            items: items.into(),
+            length: Length::UNDEFINED,
+        }
+    }
+}
+
+impl<I> From<[I; 1]> for DataSetSequence<I> {
+    /// Constructs a data set sequence with a single item
+    /// and an undefined length.
+    #[inline]
+    fn from([item]: [I; 1]) -> Self {
+        DataSetSequence {
+            items: smallvec::smallvec![item],
+            length: Length::UNDEFINED,
+        }
+    }
+}
+
 impl<I, P> From<DataSetSequence<I>> for Value<I, P> {
     #[inline]
     fn from(value: DataSetSequence<I>) -> Self {
@@ -808,6 +916,7 @@ where
     ///
     /// This implementation only checks for item equality,
     /// disregarding the byte length.
+    #[inline]
     fn eq(&self, other: &DataSetSequence<I>) -> bool {
         self.items() == other.items()
     }
@@ -834,11 +943,6 @@ impl<P> PixelFragmentSequence<P> {
     ///
     /// **Note:** This function does not validate the offset table
     /// against the given fragments.
-    ///
-    /// _and_ not validate the `length` against the other fields.
-    /// When not sure,
-    /// `length` can be set to [`UNDEFINED`](Length::UNDEFINED)
-    /// to leave it as implicitly defined.
     #[inline]
     pub fn new(offset_table: impl Into<C<u32>>, fragments: impl Into<C<P>>) -> Self {
         PixelFragmentSequence {
@@ -850,14 +954,6 @@ impl<P> PixelFragmentSequence<P> {
     /// Construct a DICOM pixel sequence sequence value
     /// from a list of fragments,
     /// with an empty basic offset table.
-    ///
-    /// **Note:** This function does not validate the offset table
-    /// against the given fragments.
-    ///
-    /// _and_ not validate the `length` against the other fields.
-    /// When not sure,
-    /// `length` can be set to [`UNDEFINED`](Length::UNDEFINED)
-    /// to leave it as implicitly defined.
     #[inline]
     pub fn new_fragments(fragments: impl Into<C<P>>) -> Self {
         PixelFragmentSequence {
@@ -874,6 +970,14 @@ impl<P> PixelFragmentSequence<P> {
         &self.fragments
     }
 
+    /// Gets a mutable reference to the pixel data fragments.
+    ///
+    /// This sequence does not include the offset table.
+    #[inline]
+    pub fn fragments_mut(&mut self) -> &mut C<P> {
+        &mut self.fragments
+    }
+
     /// Retrieve the pixel data fragments,
     /// discarding the rest of the information.
     ///
@@ -883,17 +987,20 @@ impl<P> PixelFragmentSequence<P> {
         self.fragments
     }
 
-    /// Decompose the sequencce into its constituent parts:
+    /// Decompose the sequence into its constituent parts:
     /// the basic offset table and the pixel data fragments.
     pub fn into_parts(self) -> (C<u32>, C<P>) {
         (self.offset_table, self.fragments)
     }
 
     /// Gets a reference to the encapsulated pixel data's offset table.
-    ///
-    /// Returns `None` if the value is not a pixel data sequence.
     pub fn offset_table(&self) -> &[u32] {
         &self.offset_table
+    }
+
+    /// Gets a mutable reference to the encapsulated pixel data's offset table.
+    pub fn offset_table_mut(&mut self) -> &mut C<u32> {
+        &mut self.offset_table
     }
 
     /// Get the value data's length
@@ -904,6 +1011,22 @@ impl<P> PixelFragmentSequence<P> {
     #[inline]
     pub fn length(&self) -> Length {
         HasLength::length(self)
+    }
+}
+
+impl<T, F, P> From<(T, F)> for PixelFragmentSequence<P>
+where
+    T: Into<C<u32>>,
+    F: Into<C<P>>,
+{
+    /// Construct a pixel data fragment sequence,
+    /// interpreting the first tuple element as a basic offset table
+    /// and the second element as the vector of fragments.
+    ///
+    /// **Note:** This function does not validate the offset table
+    /// against the given fragments.
+    fn from((offset_table, fragments): (T, F)) -> Self {
+        PixelFragmentSequence::new(offset_table, fragments)
     }
 }
 
@@ -1142,7 +1265,9 @@ mod tests {
         // declarations are equivalent
         let v3 = Value::from(PrimitiveValue::from("Something"));
         let v4 = Value::new(dicom_value!(Str, "Something"));
+        let v3_2: Value = "Something".into();
         assert_eq!(v3, v4);
+        assert_eq!(v3, v3_2);
 
         // redeclare with different type parameters
         let v3: Value<DummyItem, _> = PrimitiveValue::from("Something").into();

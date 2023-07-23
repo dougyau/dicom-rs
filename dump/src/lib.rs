@@ -32,15 +32,19 @@
 //! options.width(100).dump_file(&obj)?;
 //! # Result::<(), Box<dyn std::error::Error>>::Ok(())
 //! ```
-use colored::*;
-use dicom_core::dictionary::{DataDictionary, DictionaryEntry};
+#[cfg(feature = "sop-class")]
+use dicom_core::dictionary::UidDictionary;
+use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::Header;
 use dicom_core::value::{PrimitiveValue, Value as DicomValue};
 use dicom_core::VR;
+#[cfg(feature = "sop-class")]
+use dicom_dictionary_std::StandardSopClassDictionary;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::mem::{InMemDicomObject, InMemElement};
 use dicom_object::{FileDicomObject, FileMetaTable, StandardDataDictionary};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use owo_colors::*;
 use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 use std::io::{stdout, Result as IoResult, Write};
@@ -136,6 +140,10 @@ impl DumpOptions {
     }
 
     /// Set the maximum output width in number of characters.
+    ///
+    /// The methods [`dump_file_to`] and [`dump_object_to`],
+    /// will print everything to the end,
+    /// regardless of this option.
     pub fn width(&mut self, width: u32) -> &mut Self {
         self.width = Some(width);
         self
@@ -147,6 +155,10 @@ impl DumpOptions {
     /// This is the default behavior.
     /// If a terminal width could not be determined,
     /// the default width of 120 characters is used.
+    ///
+    /// The methods [`dump_file_to`] and [`dump_object_to`],
+    /// will print everything to the end,
+    /// regardless of this option.
     pub fn width_auto(&mut self) -> &mut Self {
         self.width = None;
         self
@@ -176,33 +188,51 @@ impl DumpOptions {
     where
         D: DataDictionary,
     {
-        self.dump_file_to(stdout(), obj)
+        self.dump_file_impl(stdout(), obj, true)
     }
 
     /// Dump the contents of an open DICOM file to the given writer.
     pub fn dump_file_to<D>(
         &self,
-        mut to: impl Write,
+        to: impl Write,
         obj: &FileDicomObject<InMemDicomObject<D>>,
     ) -> IoResult<()>
     where
         D: DataDictionary,
     {
+        self.dump_file_impl(to, obj, false)
+    }
+
+    fn dump_file_impl<D>(
+        &self,
+        mut to: impl Write,
+        obj: &FileDicomObject<InMemDicomObject<D>>,
+        to_stdout: bool,
+    ) -> IoResult<()>
+    where
+        D: DataDictionary,
+    {
         match self.color {
-            ColorMode::Never => colored::control::set_override(false),
-            ColorMode::Always => colored::control::set_override(true),
-            ColorMode::Auto => colored::control::unset_override(),
+            ColorMode::Never => owo_colors::set_override(false),
+            ColorMode::Always => owo_colors::set_override(true),
+            ColorMode::Auto => owo_colors::unset_override(),
         }
 
         let meta = obj.meta();
 
         let width = determine_width(self.width);
 
-        meta_dump(&mut to, meta, if self.no_limit { u32::MAX } else { width })?;
+        let (no_text_limit, no_limit) = if to_stdout {
+            (self.no_text_limit, self.no_limit)
+        } else {
+            (true, true)
+        };
+
+        meta_dump(&mut to, meta, if no_limit { u32::MAX } else { width })?;
 
         writeln!(to, "{:-<58}", "")?;
 
-        dump(&mut to, obj, width, 0, self.no_text_limit, self.no_limit)?;
+        dump(&mut to, obj, width, 0, no_text_limit, no_limit)?;
 
         Ok(())
     }
@@ -241,20 +271,22 @@ impl DumpOptions {
             (ColorMode::Auto, true) => colored::control::unset_override(),
         }
 
-        let width = if let Some((width, _)) = term_size::dimensions() {
-            width as u32
+        let width = determine_width(self.width);
+
+        let (no_text_limit, no_limit) = if to_stdout {
+            (self.no_text_limit, self.no_limit)
         } else {
-            120
+            (true, true)
         };
 
-        dump(&mut to, obj, width, 0, self.no_text_limit, self.no_limit)?;
+        dump(&mut to, obj, width, 0, no_text_limit, no_limit)?;
 
         Ok(())
     }
 }
 
 /// Enumeration of output coloring modes.
-#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug, Default, Copy, Clone, Eq, Hash, PartialEq)]
 pub enum ColorMode {
     /// Produce colored output if supported by the destination
     /// (namely, if the destination is a terminal).
@@ -263,17 +295,12 @@ pub enum ColorMode {
     /// the output will not be colored.
     ///
     /// This is the default behavior.
+    #[default]
     Auto,
     /// Never produce colored output.
     Never,
     /// Always produce colored output.
     Always,
-}
-
-impl Default for ColorMode {
-    fn default() -> Self {
-        ColorMode::Auto
-    }
 }
 
 impl std::fmt::Display for ColorMode {
@@ -326,22 +353,46 @@ where
 
 impl<T> fmt::Display for DumpValue<T>
 where
-    T: ToString,
+    T: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let value = match self {
-            DumpValue::TagNum(v) => v.to_string().dimmed(),
-            DumpValue::Alias(v) => v.to_string().bold(),
-            DumpValue::Num(v) => v.to_string().cyan(),
-            DumpValue::Str(v) => v.to_string().yellow(),
-            DumpValue::DateTime(v) => v.to_string().green(),
-            DumpValue::Invalid(v) => v.to_string().red(),
-            DumpValue::Nothing => "(no value)".italic(),
-        };
-        if let Some(width) = f.width() {
-            write!(f, "{:width$}", value, width = width)
-        } else {
-            write!(f, "{}", value)
+        fn write_value_with_width(value: impl fmt::Display, f: &mut fmt::Formatter) -> fmt::Result {
+            if let Some(width) = f.width() {
+                write!(f, "{:width$}", value, width = width)
+            } else {
+                write!(f, "{}", value)
+            }
+        }
+
+        match self {
+            DumpValue::TagNum(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.dimmed());
+                write_value_with_width(value, f)
+            }
+            DumpValue::Alias(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.bold());
+                write_value_with_width(value, f)
+            }
+            DumpValue::Num(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.cyan());
+                write_value_with_width(value, f)
+            }
+            DumpValue::Str(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.yellow());
+                write_value_with_width(value, f)
+            }
+            DumpValue::DateTime(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.green());
+                write_value_with_width(value, f)
+            }
+            DumpValue::Invalid(v) => {
+                let value = v.if_supports_color(Stream::Stdout, |v| v.red());
+                write_value_with_width(value, f)
+            }
+            DumpValue::Nothing => {
+                let value = "(no value)".if_supports_color(Stream::Stdout, |v| v.italic());
+                write_value_with_width(value, f)
+            }
         }
     }
 }
@@ -391,17 +442,41 @@ fn meta_dump<W>(to: &mut W, meta: &FileMetaTable, width: u32) -> IoResult<()>
 where
     W: ?Sized + Write,
 {
+    let sop_class_uid = meta
+        .media_storage_sop_class_uid
+        .trim_end_matches(whitespace_or_null);
+
+    #[cfg(feature = "sop-class")]
+    #[inline]
+    fn translate_sop_class(uid: &str) -> Option<&'static str> {
+        StandardSopClassDictionary.by_uid(uid).map(|e| e.name)
+    }
+    #[cfg(not(feature = "sop-class"))]
+    #[inline]
+    fn translate_sop_class(_uid: &str) -> Option<&'static str> {
+        None
+    }
+
+    if let Some(name) = translate_sop_class(sop_class_uid) {
+        writeln!(
+            to,
+            "{}: {} ({})",
+            "Media Storage SOP Class UID".if_supports_color(Stream::Stdout, |v| v.bold()),
+            sop_class_uid,
+            name,
+        )?;
+    } else {
+        writeln!(
+            to,
+            "{}: {}",
+            "Media Storage SOP Class UID".if_supports_color(Stream::Stdout, |v| v.bold()),
+            sop_class_uid,
+        )?;
+    }
     writeln!(
         to,
         "{}: {}",
-        "Media Storage SOP Class UID".bold(),
-        meta.media_storage_sop_class_uid
-            .trim_end_matches(whitespace_or_null),
-    )?;
-    writeln!(
-        to,
-        "{}: {}",
-        "Media Storage SOP Instance UID".bold(),
+        "Media Storage SOP Instance UID".if_supports_color(Stream::Stdout, |v| v.bold()),
         meta.media_storage_sop_instance_uid
             .trim_end_matches(whitespace_or_null),
     )?;
@@ -409,7 +484,7 @@ where
         writeln!(
             to,
             "{}: {} ({})",
-            "Transfer Syntax".bold(),
+            "Transfer Syntax".if_supports_color(Stream::Stdout, |v| v.bold()),
             ts.uid(),
             ts.name()
         )?;
@@ -417,14 +492,14 @@ where
         writeln!(
             to,
             "{}: {} («UNKNOWN»)",
-            "Transfer Syntax".bold(),
+            "Transfer Syntax".if_supports_color(Stream::Stdout, |v| v.bold()),
             meta.transfer_syntax.trim_end_matches(whitespace_or_null)
         )?;
     }
     writeln!(
         to,
         "{}: {}",
-        "Implementation Class UID".bold(),
+        "Implementation Class UID".if_supports_color(Stream::Stdout, |v| v.bold()),
         meta.implementation_class_uid
             .trim_end_matches(whitespace_or_null),
     )?;
@@ -433,7 +508,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Implementation version name".bold(),
+            "Implementation version name".if_supports_color(Stream::Stdout, |v| v.bold()),
             v.trim_end()
         )?;
     }
@@ -442,7 +517,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Source Application Entity Title".bold(),
+            "Source Application Entity Title".if_supports_color(Stream::Stdout, |v| v.bold()),
             v.trim_end()
         )?;
     }
@@ -451,7 +526,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Sending Application Entity Title".bold(),
+            "Sending Application Entity Title".if_supports_color(Stream::Stdout, |v| v.bold()),
             v.trim_end()
         )?;
     }
@@ -460,7 +535,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Receiving Application Entity Title".bold(),
+            "Receiving Application Entity Title".if_supports_color(Stream::Stdout, |v| v.bold()),
             v.trim_end()
         )?;
     }
@@ -469,7 +544,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Private Information Creator UID".bold(),
+            "Private Information Creator UID".if_supports_color(Stream::Stdout, |v| v.bold()),
             v.trim_end_matches(whitespace_or_null)
         )?;
     }
@@ -478,7 +553,7 @@ where
         writeln!(
             to,
             "{}: {}",
-            "Private Information".bold(),
+            "Private Information".if_supports_color(Stream::Stdout, |v| v.bold()),
             format_value_list(v.iter().map(|n| format!("{:02X}", n)), Some(width), false)
         )?;
     }
@@ -521,7 +596,7 @@ where
     let indent = vec![b' '; (depth * 2) as usize];
     let tag_alias = StandardDataDictionary
         .by_tag(elem.tag())
-        .map(DictionaryEntry::alias)
+        .map(DataDictionaryEntry::alias)
         .unwrap_or("«Unknown Attribute»");
     to.write_all(&indent)?;
     let vm = match elem.vr() {
@@ -530,7 +605,7 @@ where
     };
 
     match elem.value() {
-        DicomValue::Sequence { items, .. } => {
+        DicomValue::Sequence(seq) => {
             writeln!(
                 to,
                 "{} {:28} {} ({} Item{})",
@@ -540,7 +615,7 @@ where
                 vm,
                 if vm == 1 { "" } else { "s" },
             )?;
-            for item in items {
+            for item in seq.items() {
                 dump_item(&mut *to, item, width, depth + 2, no_text_limit, no_limit)?;
             }
             to.write_all(&indent)?;
@@ -551,13 +626,10 @@ where
                 DumpValue::Alias("SequenceDelimitationItem"),
             )?;
         }
-        DicomValue::PixelSequence {
-            fragments,
-            offset_table,
-        } => {
+        DicomValue::PixelSequence(seq) => {
             // write pixel sequence start line
             let vr = elem.vr();
-            let num_items = 1 + fragments.len();
+            let num_items = 1 + seq.fragments().len();
             writeln!(
                 to,
                 "{} {:28} {} (PixelSequence, {} Item{})",
@@ -569,7 +641,8 @@ where
             )?;
 
             // write offset table
-            let byte_len = offset_table.len();
+            let offset_table = seq.offset_table();
+            let byte_len = offset_table.len() * 4;
             let summary = offset_table_summary(
                 offset_table,
                 Some(width)
@@ -578,14 +651,15 @@ where
             );
             writeln!(
                 to,
-                "  {} offset table ({:>3} bytes, 1 Item): {:48}",
+                "  {} offset table ({:>2}, {:>2} bytes): {}",
                 DumpValue::TagNum("(FFFE,E000)"),
+                offset_table.len(),
                 byte_len,
                 summary,
             )?;
 
             // write compressed fragments
-            for fragment in fragments {
+            for fragment in seq.fragments() {
                 let byte_len = fragment.len();
                 let summary = item_value_summary(
                     fragment,
@@ -595,7 +669,7 @@ where
                 );
                 writeln!(
                     to,
-                    "  {} pi ({:>3} bytes, 1 Item): {:48}",
+                    "  {} pi ({:>3} bytes): {}",
                     DumpValue::TagNum("(FFFE,E000)"),
                     byte_len,
                     summary
@@ -734,7 +808,7 @@ fn value_summary(
             }
         }
         (Strs(values), VR::DT) => {
-            match value.to_multi_datetime(dicom_core::chrono::FixedOffset::east(0)) {
+            match value.to_multi_datetime(dicom_core::chrono::FixedOffset::east_opt(0).unwrap()) {
                 Ok(values) => {
                     // print as reformatted date
                     DumpValue::DateTime(format_value_list(values, max_characters, false))
@@ -752,15 +826,22 @@ fn value_summary(
             max_characters,
             true,
         )),
-        (Date(values), _) => DumpValue::DateTime(format_value_list(values, max_characters, true)),
-        (Time(values), _) => DumpValue::DateTime(format_value_list(values, max_characters, true)),
+        (Date(values), _) => DumpValue::DateTime(format_value_list(values, max_characters, false)),
+        (Time(values), _) => DumpValue::DateTime(format_value_list(values, max_characters, false)),
         (DateTime(values), _) => {
-            DumpValue::DateTime(format_value_list(values, max_characters, true))
+            DumpValue::DateTime(format_value_list(values, max_characters, false))
         }
         (Str(value), _) => {
             let txt = format!(
                 "\"{}\"",
-                value.to_string().trim_end_matches(whitespace_or_null)
+                value
+                    .to_string()
+                    .trim_end_matches(whitespace_or_null)
+                    // sanitize input
+                    .replace('\n', "␊")
+                    .replace('\r', "␍")
+                    .replace('\0', "␀")
+                    .replace(|c: char| c.is_control(), "�")
             );
             if let Some(max) = max_characters {
                 DumpValue::Str(cut_str(&txt, max).to_string())
@@ -785,7 +866,7 @@ fn offset_table_summary(data: &[u32], max_characters: Option<u32>) -> String {
         format!("{}", "(empty)".italic())
     } else {
         format_value_list(
-            data.iter().map(|n| format!("{:02X}", n)),
+            data.iter().map(|n| format!("{:04X}", n)),
             max_characters,
             false,
         )
@@ -807,7 +888,13 @@ where
     }
     for piece in values {
         let mut piece = piece.to_string();
-        piece = piece.replace(|c: char| c.is_control(), "�");
+        // sanitize value piece
+        piece = piece
+            .replace('\n', "␊")
+            .replace('\r', "␍")
+            .replace('\0', "␀")
+            .replace(|c: char| c.is_control(), "�");
+
         if acc_size > 0 {
             pieces.push_str(", ");
         }
@@ -864,7 +951,7 @@ fn determine_width(user_width: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
 
-    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_core::{value::DicomDate, DataElement, PrimitiveValue, VR};
     use dicom_dictionary_std::tags;
     use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 
@@ -908,10 +995,17 @@ mod tests {
             .expect("output is not valid UTF-8")
             .split('\n')
             .collect();
-        assert_eq!(
-            lines[0],
-            "Media Storage SOP Class UID: 1.2.840.10008.5.1.4.1.1.1"
-        );
+        if cfg!(feature = "sop-class") {
+            assert_eq!(
+                lines[0],
+                "Media Storage SOP Class UID: 1.2.840.10008.5.1.4.1.1.1 (Computed Radiography Image Storage)"
+            );
+        } else {
+            assert_eq!(
+                lines[0],
+                "Media Storage SOP Class UID: 1.2.840.10008.5.1.4.1.1.1"
+            );
+        }
         assert_eq!(lines[1], "Media Storage SOP Instance UID: 1.2.888.123");
         assert_eq!(
             lines[2],
@@ -932,11 +1026,31 @@ mod tests {
     #[test]
     fn dump_object_to_covers_properties() {
         // create object
-        let obj = InMemDicomObject::from_element_iter(vec![DataElement::new(
-            tags::SOP_INSTANCE_UID,
-            VR::UI,
-            PrimitiveValue::from("1.2.888.123"),
-        )]);
+        let obj = InMemDicomObject::from_element_iter([
+            DataElement::new(
+                tags::SOP_INSTANCE_UID,
+                VR::UI,
+                PrimitiveValue::from("1.2.888.123"),
+            ),
+            DataElement::new(
+                tags::STUDY_DATE,
+                VR::DA,
+                PrimitiveValue::from(DicomDate::from_ymd(2017, 1, 1).unwrap()),
+            ),
+            DataElement::new(tags::CONTENT_DATE, VR::DA, PrimitiveValue::Empty),
+            DataElement::new(tags::MODALITY, VR::CS, PrimitiveValue::from("OT")),
+            DataElement::new(
+                tags::INSTITUTION_NAME,
+                VR::LO,
+                PrimitiveValue::from("Hospital"),
+            ),
+            DataElement::new(
+                tags::INSTITUTION_ADDRESS,
+                VR::ST,
+                PrimitiveValue::from("Country Roads 1\nWest Virginia"),
+            ),
+            DataElement::new(tags::SAMPLES_PER_PIXEL, VR::US, PrimitiveValue::from(3_u16)),
+        ]);
 
         let mut out = Vec::new();
         DumpOptions::new()
@@ -948,8 +1062,34 @@ mod tests {
             .expect("output is not valid UTF-8")
             .split('\n')
             .collect();
-        let parts: Vec<&str> = lines[0].split(" ").filter(|p| !p.is_empty()).collect();
 
-        assert_eq!(&parts[..3], &["(0008,0018)", "SOPInstanceUID", "UI"]);
+        check_line(
+            lines[0],
+            ("(0008,0018)", "SOPInstanceUID", "UI", "\"1.2.888.123\""),
+        );
+        check_line(lines[1], ("(0008,0020)", "StudyDate", "DA", "2017-01-01"));
+        check_line(lines[2], ("(0008,0023)", "ContentDate", "DA", "(no value)"));
+        check_line(lines[3], ("(0008,0060)", "Modality", "CS", "\"OT\""));
+        check_line(
+            lines[4],
+            ("(0008,0080)", "InstitutionName", "LO", "\"Hospital\""),
+        );
+        check_line(
+            lines[5],
+            (
+                "(0008,0081)",
+                "InstitutionAddress",
+                "ST",
+                "\"Country Roads 1␊West Virginia\"",
+            ),
+        );
+        check_line(lines[6], ("(0028,0002)", "SamplesPerPixel", "US", "3"));
+
+        fn check_line(line: &str, expected: (&str, &str, &str, &str)) {
+            let parts: Vec<&str> = line.split(" ").filter(|p| !p.is_empty()).collect();
+            let value = line.split(':').nth(1).unwrap().trim();
+            assert_eq!(&parts[..3], &[expected.0, expected.1, expected.2]);
+            assert_eq!(value, expected.3);
+        }
     }
 }

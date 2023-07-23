@@ -3,7 +3,8 @@
 //! element header, and element composite types.
 
 use crate::value::{
-    CastValueError, ConvertValueError, DicomDate, DicomDateTime, DicomTime, PrimitiveValue, Value,
+    CastValueError, ConvertValueError, DataSetSequence, DicomDate, DicomDateTime, DicomTime,
+    InMemFragment, PrimitiveValue, Value, C,
 };
 use chrono::FixedOffset;
 use num_traits::NumCast;
@@ -81,9 +82,11 @@ pub trait Header: HasLength {
 
 /// Stub type representing a non-existing DICOM object.
 ///
-/// This type implements `HasLength`, but cannot be instantiated.
-/// This makes it so that `Value<EmptyObject>` is sure to be either a primitive
-/// value or a sequence with no items.
+/// This type implements [`HasLength`], but cannot be instantiated.
+/// This makes it so that [`Value<EmptyObject>`] is sure to be either
+/// a primitive value,
+/// a pixel data fragment sequence,
+/// or a sequence with no items.
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum EmptyObject {}
 
@@ -97,10 +100,12 @@ impl HasLength for EmptyObject {
 ///
 /// This type is capable of representing any data element fully in memory,
 /// whether it be a primitive value,
-/// a nested data set (where each item contains an object of type `I`),
+/// a nested data set (where `I` is the object type for data set items),
 /// or an encapsulated pixel data sequence (each item of type `P`).
+/// The type parameter `I` should usually implement [`HasLength`],
+/// whereas `P` should usually implement `AsRef<[u8]>`.
 #[derive(Debug, PartialEq, Clone)]
-pub struct DataElement<I = EmptyObject, P = [u8; 0]> {
+pub struct DataElement<I = EmptyObject, P = InMemFragment> {
     header: DataElementHeader,
     value: Value<I, P>,
 }
@@ -202,7 +207,11 @@ impl<I, P> DataElement<I, P> {
                 vr,
                 len: Length(0),
             },
-            value: PrimitiveValue::Empty.into(),
+            value: if vr == VR::SQ {
+                DataSetSequence::empty().into()
+            } else {
+                PrimitiveValue::Empty.into()
+            },
         }
     }
 
@@ -228,13 +237,53 @@ impl<I, P> DataElement<I, P> {
     pub fn into_value(self) -> Value<I, P> {
         self.value
     }
+
+    /// Split the constituent parts of this element into a tuple.
+    /// If the value is a sequence,
+    /// its lifetime may still be bound to the original source.
+    pub fn into_parts(self) -> (DataElementHeader, Value<I, P>) {
+        (self.header, self.value)
+    }
+
+    /// Obtain a temporary mutable reference to the value,
+    /// so that mutations can be applied within.
+    ///
+    /// Once updated, the header is automatically updated
+    /// based on this set of rules:
+    ///
+    /// - if the value is a data set sequence,
+    ///   the VR is set to `SQ` and the length is reset to undefined;
+    /// - if the value is a pixel data fragment sequence,
+    ///   the VR is set to `OB` and the lenght is reset to undefined;
+    /// - if the value is primitive,
+    ///   the length is recalculated, leaving the VR as is.
+    ///
+    /// If these rules do not result in a valid element,
+    /// consider reconstructing the data element instead.
+    pub fn update_value(&mut self, mut f: impl FnMut(&mut Value<I, P>)) {
+        f(&mut self.value);
+        match &mut self.value {
+            Value::Primitive(v) => {
+                let byte_len = v.calculate_byte_len();
+                self.header.len = Length(byte_len as u32);
+            }
+            Value::Sequence(_) => {
+                self.header.vr = VR::SQ;
+                self.header.len = Length::UNDEFINED;
+            }
+            Value::PixelSequence(_) => {
+                self.header.vr = VR::OB;
+                self.header.len = Length::UNDEFINED;
+            }
+        }
+    }
 }
 
 impl<I, P> DataElement<I, P>
 where
     I: HasLength,
 {
-    /// Create a primitive data element from the given parts,
+    /// Create a data element from the given parts,
     /// where the length is inferred from the value's byte length.
     ///
     /// If the value is textual,
@@ -283,7 +332,7 @@ where
     /// with no trailing whitespace.
     ///
     /// Returns an error if the value is not primitive.
-    pub fn to_str(&self) -> Result<Cow<str>, CastValueError> {
+    pub fn to_str(&self) -> Result<Cow<str>, ConvertValueError> {
         self.value.to_str()
     }
 
@@ -291,17 +340,8 @@ where
     /// with trailing whitespace kept.
     ///
     /// Returns an error if the value is not primitive.
-    pub fn to_raw_str(&self) -> Result<Cow<str>, CastValueError> {
+    pub fn to_raw_str(&self) -> Result<Cow<str>, ConvertValueError> {
         self.value.to_raw_str()
-    }
-
-    /// Retrieves the element's value as a clean string
-    #[deprecated(
-        note = "`to_clean_str()` is now deprecated in favour of using `to_str()` directly.
-        `to_raw_str()` replaces the old functionality of `to_str()` and maintains all trailing whitespace."
-    )]
-    pub fn to_clean_str(&self) -> Result<Cow<str>, CastValueError> {
-        self.value.to_str()
     }
 
     /// Convert the full primitive value into raw bytes.
@@ -310,8 +350,8 @@ where
     /// are provided in UTF-8.
     ///
     /// Returns an error if the value is not primitive.
-    pub fn to_bytes(&self) -> Result<Cow<[u8]>, CastValueError> {
-        self.value().to_bytes()
+    pub fn to_bytes(&self) -> Result<Cow<[u8]>, ConvertValueError> {
+        self.value.to_bytes()
     }
 
     /// Convert the full value of the data element into a sequence of strings.
@@ -486,9 +526,46 @@ where
 
     /// Retrieve the items stored in a sequence value.
     ///
-    /// Returns `None` if the value is not a sequence.
+    /// Returns `None` if the underlying value is not a data set sequence.
     pub fn items(&self) -> Option<&[I]> {
         self.value().items()
+    }
+
+    /// Gets a mutable reference to the items of a sequence value.
+    ///
+    /// The header's recorded length is automatically reset to undefined,
+    /// in order to prevent inconsistencies.
+    ///
+    /// Returns `None` if the underlying value is not a data set sequence.
+    pub fn items_mut(&mut self) -> Option<&mut C<I>> {
+        self.header.len = Length::UNDEFINED;
+        self.value.items_mut()
+    }
+
+    /// Retrieve the fragments stored in a pixel data sequence value.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn fragments(&self) -> Option<&[P]> {
+        self.value().fragments()
+    }
+
+    /// Obtain a mutable reference to the fragments
+    /// stored in a pixel data sequence value.
+    ///
+    /// The header's recorded length is automatically reset to undefined,
+    /// in order to prevent inconsistencies.
+    ///
+    /// Returns `None` if the value is not a pixel data sequence.
+    pub fn fragments_mut(&mut self) -> Option<&mut C<P>> {
+        self.header.len = Length::UNDEFINED;
+        self.value.fragments_mut()
+    }
+
+    /// Obtain a reference to the encapsulated pixel data's basic offset table.
+    ///
+    /// Returns `None` if the underlying value is not a pixel data sequence.
+    pub fn offset_table(&self) -> Option<&[u32]> {
+        self.value().offset_table()
     }
 }
 
@@ -908,25 +985,30 @@ pub type ElementNumber = u16;
 
 /// The data type for DICOM data element tags.
 ///
-/// Since  types will not have a monomorphized tag, and so will only support
-/// a (group, element) pair. For this purpose, `Tag` also provides a method
-/// for converting it to a tuple. Both `(u16, u16)` and `[u16; 2]` can be
-/// efficiently converted to this type as well.
+/// Tags are composed by a (group, element) pair of 16-bit unsigned integers.
+/// Aside from writing a struct expression,
+/// a `Tag` may also be built by converting a `(u16, u16)` or a `[u16; 2]`.
 ///
-/// Moreover, strings following the conventional text format
-/// found in the DICOM standard
-/// (e.g. `(7FE0,0010)`)
-/// can be parsed using its `FromStr` implementation.
+/// In its text form,
+/// DICOM tags are printed by [`Display`][display] in the form `(GGGG,EEEE)`,
+/// where the group and element parts are in uppercase hexadecimal.
+/// Moreover, its [`FromStr`][fromstr] implementation
+/// support converting strings in the following text formats into DICOM tags:
+///
+/// - `(GGGG,EEEE)`
+/// - `GGGG,EEEE`
+/// - `GGGGEEEE`
+///
+/// [display]: std::fmt::Display
+/// [fromstr]: std::str::FromStr
 ///
 /// # Example
 ///
 /// ```
 /// # use dicom_core::Tag;
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let tag: Tag = "(0010,1005)".parse()?;
 /// assert_eq!(tag, Tag(0x0010, 0x1005));
-/// Ok(())
-/// # }
+/// # Ok::<_, dicom_core::header::ParseTagError>(())
 /// ```
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 pub struct Tag(pub GroupNumber, pub ElementNumber);
@@ -954,18 +1036,6 @@ impl fmt::Debug for Tag {
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "({:04X},{:04X})", self.0, self.1)
-    }
-}
-
-impl PartialEq<(u16, u16)> for Tag {
-    fn eq(&self, other: &(u16, u16)) -> bool {
-        self.0 == other.0 && self.1 == other.1
-    }
-}
-
-impl PartialEq<[u16; 2]> for Tag {
-    fn eq(&self, other: &[u16; 2]) -> bool {
-        self.0 == other[0] && self.1 == other[1]
     }
 }
 
@@ -998,14 +1068,18 @@ pub enum ParseTagError {
     Number,
 }
 
-/// This parser implementation for tags
+/// This parser implementation for DICOM tags
 /// accepts strictly one of the following formats:
-/// - `(gggg,eeee)`
+/// - `ggggeeee`
 /// - or `gggg,eeee`
+/// - or `(gggg,eeee)`
 ///
 /// where `gggg` and `eeee` are the characters representing
 /// the group part an the element part in hexadecimal,
 /// with four characters each.
+/// Whitespace is not excluded automatically,
+/// and may need to be removed before-parse
+/// depending on the context.
 /// Lowercase and uppercase characters are allowed.
 impl FromStr for Tag {
     type Err = ParseTagError;
@@ -1036,6 +1110,14 @@ impl FromStr for Tag {
 
                 Ok(Tag(num_g, num_e))
             }
+            8 => {
+                // ggggeeee
+                let (g, e) = s.split_at(4);
+                let (num_g, _) = parse_tag_part(g)?;
+                let (num_e, _) = parse_tag_part(e)?;
+
+                Ok(Tag(num_g, num_e))
+            }
             _ => Err(ParseTagError::Length),
         }
     }
@@ -1045,12 +1127,7 @@ fn parse_tag_part(s: &str) -> Result<(u16, &str), ParseTagError> {
     ensure!(s.is_char_boundary(4), NumberSnafu);
 
     let (num, rest) = s.split_at(4);
-    ensure!(
-        num.chars().all(|c| ('0'..='9').contains(&c)
-            || ('A'..='F').contains(&c)
-            || ('a'..='f').contains(&c)),
-        NumberSnafu
-    );
+    ensure!(num.chars().all(|c| c.is_ascii_hexdigit()), NumberSnafu);
 
     let num = u16::from_str_radix(num, 16).expect("failed to parse tag part");
     Ok((num, rest))
@@ -1287,7 +1364,11 @@ impl fmt::Display for Length {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{dicom_value, DicomValue};
+    use crate::{
+        dicom_value,
+        value::{InMemFragment, PixelFragmentSequence},
+        DicomValue,
+    };
 
     #[test]
     fn to_clean_string() {
@@ -1309,6 +1390,49 @@ mod tests {
         let t = Tag::from([0x0010u16, 0x0020u16]);
         assert_eq!(0x0010u16, t.group());
         assert_eq!(0x0020u16, t.element());
+    }
+
+    /// Ensure good order between tags
+    #[test]
+    fn tag_ord() {
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0020)),
+            Ordering::Equal
+        );
+
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0024)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0020, 0x0010)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0020, 0x0024)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0000).cmp(&Tag(0x0320, 0x0010)),
+            Ordering::Less
+        );
+
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0010)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0010, 0x0024)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0010, 0x0010)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0012, 0x0010)),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -1338,6 +1462,16 @@ mod tests {
 
     #[test]
     fn parse_tag() {
+        // without parens nor comma separator
+        let tag: Tag = "00280004".parse().unwrap();
+        assert_eq!(tag, Tag(0x0028, 0x0004));
+        // lowercase
+        let tag: Tag = "7fe00001".parse().unwrap();
+        assert_eq!(tag, Tag(0x7FE0, 0x0001));
+        // uppercase
+        let tag: Tag = "7FE00001".parse().unwrap();
+        assert_eq!(tag, Tag(0x7FE0, 0x0001));
+
         // with parens, lowercase
         let tag: Tag = "(7fe0,0010)".parse().unwrap();
         assert_eq!(tag, Tag(0x7FE0, 0x0010));
@@ -1378,5 +1512,45 @@ mod tests {
         // error case: missing comma
         let r: Result<Tag, _> = "(baad&0123)".parse();
         assert_eq!(r, Err(ParseTagError::Separator));
+        // error case: comma in the wrong place
+        let r: Result<Tag, _> = "123,45678".parse();
+        assert_eq!(r, Err(ParseTagError::Number));
+        // error case: comma in the wrong place
+        let r: Result<Tag, _> = "abcde,f01".parse();
+        assert_eq!(r, Err(ParseTagError::Separator));
+        // error case: comma instead of hex digit
+        let r: Result<Tag, _> = "1234567,".parse();
+        assert_eq!(r, Err(ParseTagError::Number));
+    }
+
+    #[test]
+    fn test_update_value() {
+        // can update a string value
+        let mut e: DataElement<EmptyObject, InMemFragment> =
+            DataElement::new(Tag(0x0010, 0x0010), VR::PN, "Doe^John");
+        assert_eq!(e.length(), Length(8));
+        e.update_value(|e| {
+            *e = "Smith^John".into();
+        });
+        assert_eq!(e.length(), Length(10));
+
+        // can update a pixel sequence
+        let mut e: DataElement<EmptyObject, InMemFragment> = DataElement::new_with_len(
+            Tag(0x7FE0, 0x0010),
+            VR::OB,
+            Length(0),
+            PixelFragmentSequence::new_fragments(vec![]),
+        );
+        assert_eq!(e.length(), Length(0));
+
+        e.update_value(|v| {
+            let fragments = v.fragments_mut().unwrap();
+            fragments.push(vec![0x00; 256]);
+            fragments.push(vec![0x55; 256]);
+            fragments.push(vec![0xCC; 256]);
+        });
+
+        assert!(e.length().is_undefined());
+        assert_eq!(e.fragments().map(|f| f.len()), Some(3));
     }
 }

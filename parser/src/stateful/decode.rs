@@ -288,10 +288,10 @@ where
     pub fn file_header_parser(from: S) -> Self {
         Self {
             from,
-            basic: LittleEndianBasicDecoder::default(),
+            basic: LittleEndianBasicDecoder,
             decoder: ExplicitVRLittleEndianDecoder::default(),
             text: DefaultCharacterSetCodec,
-            dt_utc_offset: FixedOffset::east(0),
+            dt_utc_offset: FixedOffset::east_opt(0).unwrap(),
             buffer: Vec::with_capacity(PARSER_BUFFER_CAPACITY),
             position: 0,
         }
@@ -322,7 +322,7 @@ where
             basic,
             decoder,
             text,
-            dt_utc_offset: FixedOffset::east(0),
+            dt_utc_offset: FixedOffset::east_opt(0).unwrap(),
             buffer: Vec::with_capacity(PARSER_BUFFER_CAPACITY),
             position,
         }
@@ -343,7 +343,7 @@ where
         basic: BD,
         text: TC,
     ) -> Result<Self, std::io::Error> {
-        let position = from.seek(SeekFrom::Current(0))?;
+        let position = from.stream_position()?;
         Ok(Self::new_with_position(
             from, decoder, basic, text, position,
         ))

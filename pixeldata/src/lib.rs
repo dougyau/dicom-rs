@@ -1631,7 +1631,7 @@ where
                 ts_uid: transfer_syntax,
             })?;
 
-        if !ts.fully_supported() {
+        if !ts.can_decode_all() {
             return UnsupportedTransferSyntaxSnafu {
                 ts: transfer_syntax,
             }
@@ -1639,7 +1639,7 @@ where
         }
 
         // Try decoding it using a native Rust decoder
-        if let Codec::PixelData(decoder) = ts.codec() {
+        if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
             let mut data: Vec<u8> = Vec::new();
             (*decoder)
                 .decode(self, &mut data)
@@ -1675,7 +1675,7 @@ where
         let decoded_pixel_data = match pixel_data.value() {
             Value::PixelSequence(v) => {
                 // Return all fragments concatenated
-                v.fragments().into_iter().flatten().copied().collect()
+                v.fragments().iter().flatten().copied().collect()
             }
             Value::Primitive(p) => {
                 // Non-encoded, just return the pixel data for all frames
@@ -1710,15 +1710,17 @@ mod tests {
     use dicom_object::open_file;
     use dicom_test_files;
 
-
-    fn is_send_and_sync<T>() where T: Send + Sync {}
+    fn is_send_and_sync<T>()
+    where
+        T: Send + Sync,
+    {
+    }
 
     #[test]
     fn error_is_send_and_sync() {
         is_send_and_sync::<Error>();
     }
 
-    #[cfg(feature = "ndarray")]
     #[test]
     fn test_to_vec_rgb() {
         let test_file = dicom_test_files::path("pydicom/SC_rgb_16bit.dcm").unwrap();
@@ -1968,28 +1970,32 @@ mod tests {
             let values = decoded.to_vec_with_options::<u8>(&options).unwrap();
 
             let columns = decoded.columns() as usize;
-            // Validated using Numpy
-            // This doesn't reshape the array based on the PlanarConfiguration
-            // So for this scan the pixel layout is [Rlsb..Rmsb, Glsb..Gmsb, Blsb..msb]
-            assert_eq!(values.len(), 30000);
+            // validated through manual inspection of ground-truth
+            assert_eq!(values.len(), 30_000);
             // 0,0,r
             assert_eq!(values[0], 255);
             // 0,0,g
-            assert_eq!(values[1], 255);
+            assert_eq!(values[1], 0);
             // 0,0,b
-            assert_eq!(values[2], 255);
+            assert_eq!(values[2], 0);
             // 50,50,r
             assert_eq!(values[50 * columns * 3 + 50 * 3], 128);
             // 50,50,g
             assert_eq!(values[50 * columns * 3 + 50 * 3 + 1], 128);
             // 50,50,b
-            assert_eq!(values[50 * columns * 3 + 50 * 3 + 2], 128);
-            // 75,75,b
-            assert_eq!(values[75 * columns * 3 + 75 * 3], 0);
+            assert_eq!(values[50 * columns * 3 + 50 * 3 + 2], 255);
+            // 75,75,r
+            assert_eq!(values[75 * columns * 3 + 75 * 3], 64);
             // 75,75,g
-            assert_eq!(values[75 * columns * 3 + 75 * 3 + 1], 0);
+            assert_eq!(values[75 * columns * 3 + 75 * 3 + 1], 64);
             // 75,75,b
-            assert_eq!(values[75 * columns * 3 + 75 * 3 + 2], 0);
+            assert_eq!(values[75 * columns * 3 + 75 * 3 + 2], 64);
+            // 16,49,r
+            assert_eq!(values[49 * columns * 3 + 16 * 3], 0);
+            // 16,49,g
+            assert_eq!(values[49 * columns * 3 + 16 * 3 + 1], 0);
+            // 16,49,b
+            assert_eq!(values[49 * columns * 3 + 16 * 3 + 2], 255);
         }
 
         #[cfg(feature = "ndarray")]
@@ -2005,20 +2011,25 @@ mod tests {
                 .unwrap()
                 .to_ndarray_with_options::<u8>(&options)
                 .unwrap();
-            // Validated using Numpy
-            // This doesn't reshape the array based on the PlanarConfiguration
-            // So for this scan the pixel layout is [Rlsb..Rmsb, Glsb..Gmsb, Blsb..msb]
+            // validated through manual inspection of ground-truth
             assert_eq!(ndarray.shape(), &[1, 100, 100, 3]);
-            assert_eq!(ndarray.len(), 30000);
+            assert_eq!(ndarray.len(), 30_000);
+            // 0, 0
             assert_eq!(ndarray[[0, 0, 0, 0]], 255);
-            assert_eq!(ndarray[[0, 0, 0, 1]], 255);
-            assert_eq!(ndarray[[0, 0, 0, 2]], 255);
+            assert_eq!(ndarray[[0, 0, 0, 1]], 0);
+            assert_eq!(ndarray[[0, 0, 0, 2]], 0);
+            // 50, 50
             assert_eq!(ndarray[[0, 50, 50, 0]], 128);
             assert_eq!(ndarray[[0, 50, 50, 1]], 128);
-            assert_eq!(ndarray[[0, 50, 50, 2]], 128);
-            assert_eq!(ndarray[[0, 75, 75, 0]], 0);
-            assert_eq!(ndarray[[0, 75, 75, 1]], 0);
-            assert_eq!(ndarray[[0, 75, 75, 2]], 0);
+            assert_eq!(ndarray[[0, 50, 50, 2]], 255);
+            // 75, 75
+            assert_eq!(ndarray[[0, 75, 75, 0]], 64);
+            assert_eq!(ndarray[[0, 75, 75, 1]], 64);
+            assert_eq!(ndarray[[0, 75, 75, 2]], 64);
+            // 16, 49
+            assert_eq!(ndarray[[0, 49, 16, 0]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 1]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 2]], 255);
         }
 
         #[cfg(feature = "ndarray")]
@@ -2033,21 +2044,42 @@ mod tests {
                 .unwrap()
                 .to_ndarray_with_options::<u8>(&options)
                 .unwrap();
-            // Validated using Numpy
-            // This doesn't reshape the array based on the PlanarConfiguration
-            // So for this scan the pixel layout is [Rlsb..Rmsb, Glsb..Gmsb, Blsb..msb]
+            // validated through manual inspection of ground-truth
             assert_eq!(ndarray.shape(), &[2, 100, 100, 3]);
-            assert_eq!(ndarray.len(), 60000);
+            assert_eq!(ndarray.len(), 60_000);
+            // 0, 0
+            assert_eq!(ndarray[[0, 0, 0, 0]], 255);
+            assert_eq!(ndarray[[0, 0, 0, 1]], 0);
+            assert_eq!(ndarray[[0, 0, 0, 2]], 0);
+            // 50, 50
+            assert_eq!(ndarray[[0, 50, 50, 0]], 128);
+            assert_eq!(ndarray[[0, 50, 50, 1]], 128);
+            assert_eq!(ndarray[[0, 50, 50, 2]], 255);
+            // 75, 75
+            assert_eq!(ndarray[[0, 75, 75, 0]], 64);
+            assert_eq!(ndarray[[0, 75, 75, 1]], 64);
+            assert_eq!(ndarray[[0, 75, 75, 2]], 64);
+            // 16, 49
+            assert_eq!(ndarray[[0, 49, 16, 0]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 1]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 2]], 255);
             // The second frame is the inverse of the first frame
+            // 0, 0
             assert_eq!(ndarray[[1, 0, 0, 0]], 0);
-            assert_eq!(ndarray[[1, 0, 0, 1]], 0);
-            assert_eq!(ndarray[[1, 0, 0, 2]], 0);
+            assert_eq!(ndarray[[1, 0, 0, 1]], 255);
+            assert_eq!(ndarray[[1, 0, 0, 2]], 255);
+            // 50, 50
             assert_eq!(ndarray[[1, 50, 50, 0]], 127);
             assert_eq!(ndarray[[1, 50, 50, 1]], 127);
-            assert_eq!(ndarray[[1, 50, 50, 2]], 127);
-            assert_eq!(ndarray[[1, 75, 75, 0]], 255);
-            assert_eq!(ndarray[[1, 75, 75, 1]], 255);
-            assert_eq!(ndarray[[1, 75, 75, 2]], 255);
+            assert_eq!(ndarray[[1, 50, 50, 2]], 0);
+            // 75, 75
+            assert_eq!(ndarray[[1, 75, 75, 0]], 191);
+            assert_eq!(ndarray[[1, 75, 75, 1]], 191);
+            assert_eq!(ndarray[[1, 75, 75, 2]], 191);
+            // 16, 49
+            assert_eq!(ndarray[[1, 49, 16, 0]], 255);
+            assert_eq!(ndarray[[1, 49, 16, 1]], 255);
+            assert_eq!(ndarray[[1, 49, 16, 2]], 0);
         }
 
         #[cfg(feature = "ndarray")]
@@ -2062,20 +2094,24 @@ mod tests {
                 .unwrap()
                 .to_ndarray_with_options::<u16>(&options)
                 .unwrap();
-            // Validated using Numpy
-            // This doesn't reshape the array based on the PlanarConfiguration
-            // So for this scan the pixel layout is [Rlsb..Rmsb, Glsb..Gmsb, Blsb..msb]
             assert_eq!(ndarray.shape(), &[1, 100, 100, 3]);
-            assert_eq!(ndarray.len(), 30000);
+            assert_eq!(ndarray.len(), 30_000);
+            // 0,0
             assert_eq!(ndarray[[0, 0, 0, 0]], 65535);
-            assert_eq!(ndarray[[0, 0, 0, 1]], 65535);
-            assert_eq!(ndarray[[0, 0, 0, 2]], 65535);
+            assert_eq!(ndarray[[0, 0, 0, 1]], 0);
+            assert_eq!(ndarray[[0, 0, 0, 2]], 0);
+            // 50,50
             assert_eq!(ndarray[[0, 50, 50, 0]], 32896);
             assert_eq!(ndarray[[0, 50, 50, 1]], 32896);
-            assert_eq!(ndarray[[0, 50, 50, 2]], 32896);
-            assert_eq!(ndarray[[0, 75, 75, 0]], 0);
-            assert_eq!(ndarray[[0, 75, 75, 1]], 0);
-            assert_eq!(ndarray[[0, 75, 75, 2]], 0);
+            assert_eq!(ndarray[[0, 50, 50, 2]], 65535);
+            // 75,75
+            assert_eq!(ndarray[[0, 75, 75, 0]], 16448);
+            assert_eq!(ndarray[[0, 75, 75, 1]], 16448);
+            assert_eq!(ndarray[[0, 75, 75, 2]], 16448);
+            // 16, 49
+            assert_eq!(ndarray[[0, 49, 16, 0]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 1]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 2]], 65535);
         }
 
         #[cfg(feature = "ndarray")]
@@ -2093,17 +2129,40 @@ mod tests {
             // This doesn't reshape the array based on the PlanarConfiguration
             // So for this scan the pixel layout is [Rlsb..Rmsb, Glsb..Gmsb, Blsb..msb]
             assert_eq!(ndarray.shape(), &[2, 100, 100, 3]);
-            assert_eq!(ndarray.len(), 60000);
+            assert_eq!(ndarray.len(), 60_000);
+            // 0,0
+            assert_eq!(ndarray[[0, 0, 0, 0]], 65535);
+            assert_eq!(ndarray[[0, 0, 0, 1]], 0);
+            assert_eq!(ndarray[[0, 0, 0, 2]], 0);
+            // 50,50
+            assert_eq!(ndarray[[0, 50, 50, 0]], 32896);
+            assert_eq!(ndarray[[0, 50, 50, 1]], 32896);
+            assert_eq!(ndarray[[0, 50, 50, 2]], 65535);
+            // 75,75
+            assert_eq!(ndarray[[0, 75, 75, 0]], 16448);
+            assert_eq!(ndarray[[0, 75, 75, 1]], 16448);
+            assert_eq!(ndarray[[0, 75, 75, 2]], 16448);
+            // 16, 49
+            assert_eq!(ndarray[[0, 49, 16, 0]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 1]], 0);
+            assert_eq!(ndarray[[0, 49, 16, 2]], 65535);
             // The second frame is the inverse of the first frame
+            // 0,0
             assert_eq!(ndarray[[1, 0, 0, 0]], 0);
-            assert_eq!(ndarray[[1, 0, 0, 1]], 0);
-            assert_eq!(ndarray[[1, 0, 0, 2]], 0);
+            assert_eq!(ndarray[[1, 0, 0, 1]], 65535);
+            assert_eq!(ndarray[[1, 0, 0, 2]], 65535);
+            // 50,50
             assert_eq!(ndarray[[1, 50, 50, 0]], 32639);
             assert_eq!(ndarray[[1, 50, 50, 1]], 32639);
-            assert_eq!(ndarray[[1, 50, 50, 2]], 32639);
-            assert_eq!(ndarray[[1, 75, 75, 0]], 65535);
-            assert_eq!(ndarray[[1, 75, 75, 1]], 65535);
-            assert_eq!(ndarray[[1, 75, 75, 2]], 65535);
+            assert_eq!(ndarray[[1, 50, 50, 2]], 0);
+            // 75,75
+            assert_eq!(ndarray[[1, 75, 75, 0]], 49087);
+            assert_eq!(ndarray[[1, 75, 75, 1]], 49087);
+            assert_eq!(ndarray[[1, 75, 75, 2]], 49087);
+            // 16, 49
+            assert_eq!(ndarray[[1, 49, 16, 0]], 65535);
+            assert_eq!(ndarray[[1, 49, 16, 1]], 65535);
+            assert_eq!(ndarray[[1, 49, 16, 2]], 0);
         }
 
         #[cfg(feature = "image")]

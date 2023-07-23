@@ -3,7 +3,8 @@
 //! element header, and element composite types.
 
 use crate::value::{
-    CastValueError, ConvertValueError, DicomDate, DicomDateTime, DicomTime, PrimitiveValue, Value,
+    CastValueError, ConvertValueError, DataSetSequence, DicomDate, DicomDateTime, DicomTime,
+    InMemFragment, PrimitiveValue, Value, C,
 };
 use chrono::FixedOffset;
 use num_traits::NumCast;
@@ -99,10 +100,12 @@ impl HasLength for EmptyObject {
 ///
 /// This type is capable of representing any data element fully in memory,
 /// whether it be a primitive value,
-/// a nested data set (where each item contains an object of type `I`),
+/// a nested data set (where `I` is the object type for data set items),
 /// or an encapsulated pixel data sequence (each item of type `P`).
+/// The type parameter `I` should usually implement [`HasLength`],
+/// whereas `P` should usually implement `AsRef<[u8]>`.
 #[derive(Debug, PartialEq, Clone)]
-pub struct DataElement<I = EmptyObject, P = [u8; 0]> {
+pub struct DataElement<I = EmptyObject, P = InMemFragment> {
     header: DataElementHeader,
     value: Value<I, P>,
 }
@@ -204,7 +207,11 @@ impl<I, P> DataElement<I, P> {
                 vr,
                 len: Length(0),
             },
-            value: PrimitiveValue::Empty.into(),
+            value: if vr == VR::SQ {
+                DataSetSequence::empty().into()
+            } else {
+                PrimitiveValue::Empty.into()
+            },
         }
     }
 
@@ -519,9 +526,20 @@ where
 
     /// Retrieve the items stored in a sequence value.
     ///
-    /// Returns `None` if the value is not a data set sequence.
+    /// Returns `None` if the underlying value is not a data set sequence.
     pub fn items(&self) -> Option<&[I]> {
         self.value().items()
+    }
+
+    /// Gets a mutable reference to the items of a sequence value.
+    ///
+    /// The header's recorded length is automatically reset to undefined,
+    /// in order to prevent inconsistencies.
+    ///
+    /// Returns `None` if the underlying value is not a data set sequence.
+    pub fn items_mut(&mut self) -> Option<&mut C<I>> {
+        self.header.len = Length::UNDEFINED;
+        self.value.items_mut()
     }
 
     /// Retrieve the fragments stored in a pixel data sequence value.
@@ -531,9 +549,21 @@ where
         self.value().fragments()
     }
 
-    /// Obtain a reference to the encapsulated pixel data's basic offset table.
+    /// Obtain a mutable reference to the fragments
+    /// stored in a pixel data sequence value.
+    ///
+    /// The header's recorded length is automatically reset to undefined,
+    /// in order to prevent inconsistencies.
     ///
     /// Returns `None` if the value is not a pixel data sequence.
+    pub fn fragments_mut(&mut self) -> Option<&mut C<P>> {
+        self.header.len = Length::UNDEFINED;
+        self.value.fragments_mut()
+    }
+
+    /// Obtain a reference to the encapsulated pixel data's basic offset table.
+    ///
+    /// Returns `None` if the underlying value is not a pixel data sequence.
     pub fn offset_table(&self) -> Option<&[u32]> {
         self.value().offset_table()
     }
@@ -955,25 +985,30 @@ pub type ElementNumber = u16;
 
 /// The data type for DICOM data element tags.
 ///
-/// Since  types will not have a monomorphized tag, and so will only support
-/// a (group, element) pair. For this purpose, `Tag` also provides a method
-/// for converting it to a tuple. Both `(u16, u16)` and `[u16; 2]` can be
-/// efficiently converted to this type as well.
+/// Tags are composed by a (group, element) pair of 16-bit unsigned integers.
+/// Aside from writing a struct expression,
+/// a `Tag` may also be built by converting a `(u16, u16)` or a `[u16; 2]`.
 ///
-/// Moreover, strings following the conventional text format
-/// found in the DICOM standard
-/// (e.g. `(7FE0,0010)`)
-/// can be parsed using its `FromStr` implementation.
+/// In its text form,
+/// DICOM tags are printed by [`Display`][display] in the form `(GGGG,EEEE)`,
+/// where the group and element parts are in uppercase hexadecimal.
+/// Moreover, its [`FromStr`][fromstr] implementation
+/// support converting strings in the following text formats into DICOM tags:
+///
+/// - `(GGGG,EEEE)`
+/// - `GGGG,EEEE`
+/// - `GGGGEEEE`
+///
+/// [display]: std::fmt::Display
+/// [fromstr]: std::str::FromStr
 ///
 /// # Example
 ///
 /// ```
 /// # use dicom_core::Tag;
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let tag: Tag = "(0010,1005)".parse()?;
 /// assert_eq!(tag, Tag(0x0010, 0x1005));
-/// Ok(())
-/// # }
+/// # Ok::<_, dicom_core::header::ParseTagError>(())
 /// ```
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 pub struct Tag(pub GroupNumber, pub ElementNumber);
@@ -1001,18 +1036,6 @@ impl fmt::Debug for Tag {
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "({:04X},{:04X})", self.0, self.1)
-    }
-}
-
-impl PartialEq<(u16, u16)> for Tag {
-    fn eq(&self, other: &(u16, u16)) -> bool {
-        self.0 == other.0 && self.1 == other.1
-    }
-}
-
-impl PartialEq<[u16; 2]> for Tag {
-    fn eq(&self, other: &[u16; 2]) -> bool {
-        self.0 == other[0] && self.1 == other[1]
     }
 }
 
@@ -1367,6 +1390,49 @@ mod tests {
         let t = Tag::from([0x0010u16, 0x0020u16]);
         assert_eq!(0x0010u16, t.group());
         assert_eq!(0x0020u16, t.element());
+    }
+
+    /// Ensure good order between tags
+    #[test]
+    fn tag_ord() {
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0020)),
+            Ordering::Equal
+        );
+
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0024)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0020, 0x0010)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0020, 0x0024)),
+            Ordering::Less
+        );
+        assert_eq!(
+            Tag(0x0010, 0x0000).cmp(&Tag(0x0320, 0x0010)),
+            Ordering::Less
+        );
+
+        assert_eq!(
+            Tag(0x0010, 0x0020).cmp(&Tag(0x0010, 0x0010)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0010, 0x0024)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0010, 0x0010)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            Tag(0x0012, 0x0020).cmp(&Tag(0x0012, 0x0010)),
+            Ordering::Greater
+        );
     }
 
     #[test]

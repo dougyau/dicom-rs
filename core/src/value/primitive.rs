@@ -343,6 +343,14 @@ impl<'a> From<PersonName<'a>> for PrimitiveValue {
     }
 }
 
+impl From<()> for PrimitiveValue {
+    /// constructs an empty DICOM value
+    #[inline]
+    fn from(_value: ()) -> Self {
+        PrimitiveValue::Empty
+    }
+}
+
 macro_rules! impl_from_array_for_primitive {
     ($typ: ty, $variant: ident) => {
         impl From<$typ> for PrimitiveValue {
@@ -1063,30 +1071,28 @@ impl PrimitiveValue {
         match self {
             PrimitiveValue::Empty => Ok(Vec::new()),
             PrimitiveValue::Str(s) => {
-                let out = s
-                    .trim()
-                    .parse()
-                    .context(ParseIntegerSnafu)
-                    .map_err(|err| ConvertValueError {
+                let out = s.trim().parse().context(ParseIntegerSnafu).map_err(|err| {
+                    ConvertValueError {
                         requested: "integer",
                         original: self.value_type(),
                         cause: Some(err),
-                    })?;
+                    }
+                })?;
                 Ok(vec![out])
             }
-            PrimitiveValue::Strs(s) => s
-                .iter()
-                .map(|v| {
-                    v.trim()
-                        .parse()
-                        .context(ParseIntegerSnafu)
-                        .map_err(|err| ConvertValueError {
-                            requested: "integer",
-                            original: self.value_type(),
-                            cause: Some(err),
+            PrimitiveValue::Strs(s) => {
+                s.iter()
+                    .map(|v| {
+                        v.trim().parse().context(ParseIntegerSnafu).map_err(|err| {
+                            ConvertValueError {
+                                requested: "integer",
+                                original: self.value_type(),
+                                cause: Some(err),
+                            }
                         })
-                })
-                .collect::<Result<Vec<_>, _>>(),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            }
             PrimitiveValue::U8(bytes) => bytes
                 .iter()
                 .map(|v| {
@@ -1397,15 +1403,15 @@ impl PrimitiveValue {
         match self {
             PrimitiveValue::Empty => Ok(Vec::new()),
             PrimitiveValue::Str(s) => {
-                let out = s
-                    .trim()
-                    .parse()
-                    .context(ParseFloatSnafu)
-                    .map_err(|err| ConvertValueError {
-                        requested: "float32",
-                        original: self.value_type(),
-                        cause: Some(err),
-                    })?;
+                let out =
+                    s.trim()
+                        .parse()
+                        .context(ParseFloatSnafu)
+                        .map_err(|err| ConvertValueError {
+                            requested: "float32",
+                            original: self.value_type(),
+                            cause: Some(err),
+                        })?;
                 Ok(vec![out])
             }
             PrimitiveValue::Strs(s) => s
@@ -1746,15 +1752,15 @@ impl PrimitiveValue {
     pub fn to_multi_float64(&self) -> Result<Vec<f64>, ConvertValueError> {
         match self {
             PrimitiveValue::Str(s) => {
-                let out = s
-                    .trim()
-                    .parse()
-                    .context(ParseFloatSnafu)
-                    .map_err(|err| ConvertValueError {
-                        requested: "float64",
-                        original: self.value_type(),
-                        cause: Some(err),
-                    })?;
+                let out =
+                    s.trim()
+                        .parse()
+                        .context(ParseFloatSnafu)
+                        .map_err(|err| ConvertValueError {
+                            requested: "float64",
+                            original: self.value_type(),
+                            cause: Some(err),
+                        })?;
                 Ok(vec![out])
             }
             PrimitiveValue::Strs(s) => s
@@ -3875,7 +3881,8 @@ impl PrimitiveValue {
             | PrimitiveValue::DateTime(_)
             | PrimitiveValue::Time(_) => IncompatibleNumberTypeSnafu {
                 original: self.value_type(),
-            }.fail(),
+            }
+            .fail(),
         }
     }
 
@@ -4440,7 +4447,6 @@ mod tests {
 
         // DS conversion with leading whitespaces
         assert_eq!(dicom_value!(Str, " -73.4 ").to_float32().ok(), Some(-73.4));
-
 
         // DS conversion with leading whitespaces
         assert_eq!(dicom_value!(Str, " -73.4 ").to_float64().ok(), Some(-73.4));

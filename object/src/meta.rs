@@ -2,7 +2,7 @@
 use byteordered::byteorder::{ByteOrder, LittleEndian};
 use dicom_core::dicom_value;
 use dicom_core::header::{DataElement, EmptyObject, HasLength, Header};
-use dicom_core::ops::{ApplyOp, AttributeAction, AttributeOp};
+use dicom_core::ops::{ApplyOp, AttributeAction, AttributeOp, AttributeSelectorStep};
 use dicom_core::value::{PrimitiveValue, Value, ValueType};
 use dicom_core::{Length, Tag, VR};
 use dicom_dictionary_std::tags;
@@ -251,10 +251,14 @@ impl FileMetaTable {
 
     /// Apply the given attribute operation on this file meta information table.
     ///
-    /// See the [`dicom_encoding::ops`] module
+    /// See the [`dicom_core::ops`] module
     /// for more information.
     fn apply(&mut self, op: AttributeOp) -> ApplyResult {
-        match op.tag {
+        let AttributeSelectorStep::Tag(tag) = op.selector.first_step() else {
+            return UnsupportedAttributeSnafu.fail();
+        };
+
+        match *tag {
             tags::TRANSFER_SYNTAX_UID => Self::apply_required_string(op, &mut self.transfer_syntax),
             tags::MEDIA_STORAGE_SOP_CLASS_UID => {
                 Self::apply_required_string(op, &mut self.media_storage_sop_class_uid)
@@ -491,7 +495,7 @@ impl FileMetaTable {
             let (elem, _bytes_read) = decoder
                 .decode_header(&mut file)
                 .context(DecodeElementSnafu)?;
-            if elem.tag() != (0x0002, 0x0000) {
+            if elem.tag() != Tag(0x0002, 0x0000) {
                 return UnexpectedTagSnafu { tag: elem.tag() }.fail();
             }
             if elem.length() != Length(4) {
@@ -786,7 +790,7 @@ impl ApplyOp for FileMetaTable {
 
     /// Apply the given attribute operation on this file meta information table.
     ///
-    /// See the [`dicom_encoding::ops`] module
+    /// See the [`dicom_core::ops`] module
     /// for more information.
     fn apply(&mut self, op: AttributeOp) -> ApplyResult {
         self.apply(op)
@@ -1279,20 +1283,20 @@ mod tests {
 
         // replace does not set missing attributes
         table
-            .apply(AttributeOp {
-                tag: tags::IMPLEMENTATION_VERSION_NAME,
-                action: AttributeAction::ReplaceStr("MY_DICOM_1.1".into()),
-            })
+            .apply(AttributeOp::new(
+                tags::IMPLEMENTATION_VERSION_NAME,
+                AttributeAction::ReplaceStr("MY_DICOM_1.1".into()),
+            ))
             .unwrap();
 
         assert_eq!(table.implementation_version_name, None);
 
         // but SetStr does
         table
-            .apply(AttributeOp {
-                tag: tags::IMPLEMENTATION_VERSION_NAME,
-                action: AttributeAction::SetStr("MY_DICOM_1.1".into()),
-            })
+            .apply(AttributeOp::new(
+                tags::IMPLEMENTATION_VERSION_NAME,
+                AttributeAction::SetStr("MY_DICOM_1.1".into()),
+            ))
             .unwrap();
 
         assert_eq!(
@@ -1302,10 +1306,10 @@ mod tests {
 
         // Set (primitive) also works
         table
-            .apply(AttributeOp {
-                tag: tags::SOURCE_APPLICATION_ENTITY_TITLE,
-                action: AttributeAction::Set(PrimitiveValue::Str("RICOOGLE-STORAGE".into())),
-            })
+            .apply(AttributeOp::new(
+                tags::SOURCE_APPLICATION_ENTITY_TITLE,
+                AttributeAction::Set(PrimitiveValue::Str("RICOOGLE-STORAGE".into())),
+            ))
             .unwrap();
 
         assert_eq!(
@@ -1315,10 +1319,10 @@ mod tests {
 
         // set if missing works only if value isn't set yet
         table
-            .apply(AttributeOp {
-                tag: tags::SOURCE_APPLICATION_ENTITY_TITLE,
-                action: AttributeAction::SetStrIfMissing("STORE-SCU".into()),
-            })
+            .apply(AttributeOp::new(
+                tags::SOURCE_APPLICATION_ENTITY_TITLE,
+                AttributeAction::SetStrIfMissing("STORE-SCU".into()),
+            ))
             .unwrap();
 
         assert_eq!(
@@ -1327,10 +1331,10 @@ mod tests {
         );
 
         table
-            .apply(AttributeOp {
-                tag: tags::SENDING_APPLICATION_ENTITY_TITLE,
-                action: AttributeAction::SetStrIfMissing("STORE-SCU".into()),
-            })
+            .apply(AttributeOp::new(
+                tags::SENDING_APPLICATION_ENTITY_TITLE,
+                AttributeAction::SetStrIfMissing("STORE-SCU".into()),
+            ))
             .unwrap();
 
         assert_eq!(
@@ -1340,12 +1344,10 @@ mod tests {
 
         // replacing mandatory field
         table
-            .apply(AttributeOp {
-                tag: tags::MEDIA_STORAGE_SOP_CLASS_UID,
-                action: AttributeAction::Replace(PrimitiveValue::Str(
-                    "1.2.840.10008.5.1.4.1.1.7".into(),
-                )),
-            })
+            .apply(AttributeOp::new(
+                tags::MEDIA_STORAGE_SOP_CLASS_UID,
+                AttributeAction::Replace(PrimitiveValue::Str("1.2.840.10008.5.1.4.1.1.7".into())),
+            ))
             .unwrap();
 
         assert_eq!(

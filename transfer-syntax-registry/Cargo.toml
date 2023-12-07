@@ -16,7 +16,8 @@ default = ["rayon", "simd"]
 inventory-registry = ['dicom-encoding/inventory-registry']
 
 # natively implemented image encodings
-native = ["jpeg", "openjp2", "rle"]
+#native = ["jpeg", "openjp2", "rle"]
+native = ["jpeg", "rle"]
 # native implementations that work on Windows
 native_windows = ["jpeg", "rle"]
 # native JPEG support

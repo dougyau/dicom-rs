@@ -1,7 +1,7 @@
 //! Support for JPG image decoding.
 
 use dicom_core::ops::{AttributeAction, AttributeOp};
-use dicom_core::Tag;
+use dicom_core::{Tag, PrimitiveValue};
 use dicom_encoding::adapters::{
     decode_error, encode_error, DecodeResult, EncodeOptions, EncodeResult, PixelDataObject,
     PixelDataReader, PixelDataWriter,
@@ -9,6 +9,7 @@ use dicom_encoding::adapters::{
 use dicom_encoding::snafu::prelude::*;
 use jpeg_decoder::Decoder;
 use jpeg_encoder::ColorType;
+use std::borrow::Cow;
 use std::io::Cursor;
 
 /// Pixel data adapter for JPEG-based transfer syntaxes.
@@ -50,40 +51,66 @@ impl PixelDataReader for JpegAdapter {
             0,
         );
 
-        // Embedded jpegs can span multiple fragments
-        // Hence we collect all fragments into single vector
-        // and then just iterate a cursor for each frame
-        let fragments: Vec<u8> = src
+        let raw = src
             .raw_pixel_data()
-            .whatever_context("Expected to have raw pixel data available")?
-            .fragments
-            .into_iter()
-            .flatten()
-            .collect();
+            .whatever_context("Expected to have raw pixel data available")?;
+
+        // Some embedded JPEGs might span multiple fragments.
+        // Hence we collect all fragments into single vector
+        // and then iterate a cursor for each frame
+        // Note: not the most efficient way to do this,
+        // consider optimizing later with bytes data structures
+        let fragments: Vec<u8> = raw.fragments.into_iter().flatten().collect();
 
         let fragments_len = fragments.len() as u64;
         let mut cursor = Cursor::new(fragments);
         let mut dst_offset = base_offset;
 
+        let mut i: u32 = 0;
         loop {
             let mut decoder = Decoder::new(&mut cursor);
             let decoded = decoder
                 .decode()
                 .map_err(|e| Box::new(e) as Box<_>)
-                .whatever_context("JPEG decoder failure")?;
+                .with_whatever_context(|_| format!("JPEG decoding failure on frame {}", i))?;
 
             let decoded_len = decoded.len();
             dst[dst_offset..(dst_offset + decoded_len)].copy_from_slice(&decoded);
             dst_offset += decoded_len;
+            i += 1;
 
-            // dicom fields always have to have an even length and fill this space with padding
-            // if uneven we have to move one position further to consume this padding
-            if cursor.position() % 2 > 0 {
-                cursor.set_position(cursor.position() + 1);
+            if next_even(cursor.position()) >= next_even(fragments_len) {
+                break;
             }
 
-            if cursor.position() >= fragments_len {
-                break;
+            // DICOM fragments should always have an even length,
+            // filling this spacing with padding if it is odd.
+            // Some implementations might add this padding,
+            // whereas other might not.
+            // So we look for the start of the SOI marker
+            // to identify whether the padding is there
+            if cursor.position() % 2 > 0 {
+                let Some(next_byte_1) = cursor
+                    .get_ref()
+                    .get(cursor.position() as usize + 1)
+                    .copied()
+                else {
+                    // no more frames to read
+                    break;
+                };
+                let Some(next_byte_2) = cursor
+                    .get_ref()
+                    .get(cursor.position() as usize + 2)
+                    .copied()
+                else {
+                    // no more frames to read
+                    break;
+                };
+
+                if [next_byte_1, next_byte_2] == [0xFF, 0xD8] {
+                    // skip padding and continue
+                    cursor.set_position(cursor.position() + 1);
+                }
             }
         }
 
@@ -133,19 +160,54 @@ impl PixelDataReader for JpegAdapter {
         let base_offset = dst.len();
         dst.resize(base_offset + (samples_per_pixel as usize * stride), 0);
 
-        // Embedded jpegs can span multiple fragments
-        // Hence we collect all fragments into single vector
-        // and then just iterate a cursor for each frame
-        let raw_pixeldata = src
+        let raw = src
             .raw_pixel_data()
             .whatever_context("Expected to have raw pixel data available")?;
-        let fragment = raw_pixeldata
-            .fragments
-            .get(frame as usize)
-            .whatever_context("Missing fragment for the frame requested")?;
 
-        let fragment_len = fragment.len() as u64;
-        let mut cursor = Cursor::new(fragment);
+        let frame_data = if raw.fragments.len() == 1 || raw.fragments.len() == nr_frames {
+            // assuming 1:1 frame-to-fragment mapping
+            Cow::Borrowed(
+                raw.fragments
+                    .get(frame as usize)
+                    .with_whatever_context(|| format!("Missing fragment #{} for the frame requested", frame))?,
+            )
+        } else {
+            // Some embedded JPEGs might span multiple fragments.
+            // In this case we look up the basic offset table
+            // and gather all of the frame's fragments in a single vector.
+            // Note: not the most efficient way to do this,
+            // consider optimizing later with byte chunk readers 
+            let base_offset = raw.offset_table.get(frame as usize).copied();
+            let base_offset = if frame == 0 {
+                base_offset.unwrap_or(0) as usize
+            } else {
+                base_offset
+                    .with_whatever_context(|| format!("Missing offset for frame #{}", frame))?
+                    as usize
+            };
+            let next_offset = raw.offset_table.get(frame as usize + 1);
+
+            let mut offset = 0;
+            let mut fragments = Vec::new();
+            for fragment in &raw.fragments {
+                // include it
+                if offset >= base_offset {
+                    fragments.extend_from_slice(fragment);
+                }
+                offset += fragment.len() + 8;
+                if let Some(&next_offset) = next_offset {
+                    if offset >= next_offset as usize {
+                        // next fragment is for the next frame
+                        break;
+                    }
+                }
+            }
+
+            Cow::Owned(fragments)
+        };
+
+        let fragme_data_len = frame_data.len() as u64;
+        let mut cursor = Cursor::new(&*frame_data);
         let mut dst_offset = base_offset;
 
         loop {
@@ -159,14 +221,38 @@ impl PixelDataReader for JpegAdapter {
             dst[dst_offset..(dst_offset + decoded_len)].copy_from_slice(&decoded);
             dst_offset += decoded_len;
 
-            // dicom fields always have to have an even length and fill this space with padding
-            // if uneven we have to move one position further to consume this padding
-            if cursor.position() % 2 > 0 {
-                cursor.set_position(cursor.position() + 1);
+            if next_even(cursor.position()) >= next_even(fragme_data_len) {
+                break;
             }
 
-            if cursor.position() >= fragment_len {
-                break;
+            // DICOM fragments should always have an even length,
+            // filling this spacing with padding if it is odd.
+            // Some implementations might add this padding,
+            // whereas other might not.
+            // So we look for the start of the SOI marker
+            // to identify whether the padding is there
+            if cursor.position() % 2 > 0 {
+                let Some(next_byte_1) = cursor
+                    .get_ref()
+                    .get(cursor.position() as usize + 1)
+                    .copied()
+                else {
+                    // no more frames to read
+                    break;
+                };
+                let Some(next_byte_2) = cursor
+                    .get_ref()
+                    .get(cursor.position() as usize + 2)
+                    .copied()
+                else {
+                    // no more frames to read
+                    break;
+                };
+
+                if [next_byte_1, next_byte_2] == [0xFF, 0xD8] {
+                    // skip padding and continue
+                    cursor.set_position(cursor.position() + 1);
+                }
             }
         }
 
@@ -198,6 +284,11 @@ impl PixelDataWriter for JpegAdapter {
             .context(encode_error::MissingAttributeSnafu {
                 name: "BitsAllocated",
             })?;
+        let bits_stored = src
+            .bits_stored()
+            .context(encode_error::MissingAttributeSnafu {
+                name: "BitsStored",
+            })?;
 
         ensure_whatever!(
             bits_allocated == 8 || bits_allocated == 16,
@@ -219,20 +310,28 @@ impl PixelDataWriter for JpegAdapter {
         let photometric_interpretation = match samples_per_pixel {
             1 => "MONOCHROME2",
             3 => "RGB",
-            _ => unreachable!(),
+            _ => whatever!("Unsupported samples per pixel: {}", samples_per_pixel),
         };
 
         // record dst length before encoding to know full jpeg size
         let len_before = dst.len();
 
+        // identify frame data using the frame index
+        let pixeldata_uncompressed = &src
+            .raw_pixel_data()
+            .context(encode_error::MissingAttributeSnafu { name: "Pixel Data" })?
+            .fragments[0];
+
+        let frame_data = pixeldata_uncompressed.get(frame_size * frame as usize .. frame_size * (frame as usize + 1))
+            .whatever_context("Frame index out of bounds")?;
+        
+        let frame_data = narrow_8bit(frame_data, bits_stored)?;
+
         // Encode the data
-        let frame_uncompressed = src
-            .fragment(frame as usize)
-            .context(encode_error::FrameRangeOutOfBoundsSnafu)?;
         let mut encoder = jpeg_encoder::Encoder::new(&mut *dst, quality);
         encoder.set_progressive(false);
         encoder
-            .encode(&frame_uncompressed, cols, rows, color_type)
+            .encode(&frame_data, cols, rows, color_type)
             .whatever_context("JPEG encoding failed")?;
 
         let compressed_frame_size = dst.len() - len_before;
@@ -242,6 +341,12 @@ impl PixelDataWriter for JpegAdapter {
 
         // provide attribute changes
         Ok(vec![
+            // bits allocated
+            AttributeOp::new(Tag(0x0028, 0x0100), AttributeAction::Set(PrimitiveValue::from(8_u16))),
+            // bits stored
+            AttributeOp::new(Tag(0x0028, 0x0101), AttributeAction::Set(PrimitiveValue::from(8_u16))),
+            // high bit
+            AttributeOp::new(Tag(0x0028, 0x0102), AttributeAction::Set(PrimitiveValue::from(7_u16))),
             // lossy image compression
             AttributeOp::new(Tag(0x0028, 0x2110), AttributeAction::SetStr("01".into())),
             // lossy image compression ratio
@@ -255,5 +360,27 @@ impl PixelDataWriter for JpegAdapter {
                 AttributeAction::SetStr(photometric_interpretation.into()),
             ),
         ])
+    }
+}
+
+fn next_even(l: u64) -> u64 {
+    (l + 1) & !1
+}
+
+/// reduce data precision to 8 bits if necessary
+/// data loss is possible
+fn narrow_8bit(frame_data: &[u8], bits_stored: u16) -> EncodeResult<Cow<[u8]>> {
+    debug_assert!(bits_stored >= 8);
+    match bits_stored {
+        8 => Ok(Cow::Borrowed(frame_data)),
+        9..=16 => {
+            let mut v = Vec::with_capacity(frame_data.len() / 2);
+            for chunk in frame_data.chunks(2) {
+                let b = u16::from(chunk[0])| u16::from(chunk[1]) << 8;
+                v.push((b >> (bits_stored - 8)) as u8);
+            }
+            Ok(Cow::Owned(v))
+        }
+        b => whatever!("Unsupported Bits Stored {}", b),
     }
 }

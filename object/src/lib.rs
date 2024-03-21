@@ -139,8 +139,6 @@ pub mod meta;
 pub mod ops;
 pub mod tokens;
 
-mod util;
-
 pub use crate::file::{from_reader, open_file, OpenFileOptions};
 pub use crate::mem::InMemDicomObject;
 pub use crate::meta::{FileMetaTable, FileMetaTableBuilder};
@@ -719,7 +717,7 @@ mod tests {
 
     #[test]
     fn errors_not_too_large() {
-        assert_type_not_too_large::<AccessError>(48);
+        assert_type_not_too_large::<AccessError>(56);
     }
 
     #[test]

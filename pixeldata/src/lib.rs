@@ -15,7 +15,7 @@
 //! [GDCM bindings]: https://crates.io/crates/gdcm-rs
 //!
 //! ```toml
-//! dicom-pixeldata = { version = "0.1", features = ["gdcm"] }
+//! dicom-pixeldata = { version = "0.2", features = ["gdcm"] }
 //! ```
 //!
 //! Once the pixel data is decoded,
@@ -103,12 +103,14 @@
 //!
 
 use byteorder::{ByteOrder, NativeEndian};
-use dicom_core::{value::Value, DataDictionary};
+#[cfg(not(feature = "gdcm"))]
+use dicom_core::{DataDictionary, DicomValue};
 use dicom_encoding::adapters::DecodeError;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::Codec;
+#[cfg(not(feature = "gdcm"))]
 use dicom_object::{FileDicomObject, InMemDicomObject};
 #[cfg(not(feature = "gdcm"))]
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
@@ -121,8 +123,13 @@ use num_traits::NumCast;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 #[cfg(all(feature = "rayon", feature = "image"))]
 use rayon::slice::ParallelSliceMut;
-use snafu::OptionExt;
 use snafu::{Backtrace, ResultExt, Snafu};
+#[cfg(any(not(feature = "gdcm"), feature = "image"))]
+use snafu::OptionExt;
+#[cfg(not(feature = "gdcm"))]
+use snafu::ensure;
+#[cfg(not(feature = "gdcm"))]
+use std::iter::zip;
 use std::borrow::Cow;
 
 #[cfg(feature = "image")]
@@ -218,6 +225,24 @@ pub enum InnerError {
     #[snafu(display("Frame #{} is out of range", frame_number))]
     FrameOutOfRange {
         frame_number: u32,
+        backtrace: Backtrace,
+    },
+    #[snafu(display("Value multiplicity of VOI LUT Function must match the number of frames. Expected `{:?}`, found `{:?}`", nr_frames, vm))]
+    LengthMismatchVoiLutFunction {
+        vm: u32,
+        nr_frames: u32,
+        backtrace: Backtrace,
+    },
+    #[snafu(display("Value multiplicity of Rescale Slope/Intercept must match. Found `{:?}` (slope), `{:?}` (intercept)", slope_vm, intercept_vm))]
+    LengthMismatchRescale {
+        intercept_vm: u32,
+        slope_vm: u32,
+        backtrace: Backtrace,
+    },
+    #[snafu(display("Value multiplicity of Window Center/Width must match. Found `{:?}` (center), `{:?}` (width)", wc_vm, ww_vm))]
+    LengthMismatchWindowLevel {
+        wc_vm: u32,
+        ww_vm: u32,
         backtrace: Backtrace,
     },
 }
@@ -402,17 +427,20 @@ pub struct DecodedPixelData<'a> {
     high_bit: u16,
     /// the pixel representation: 0 for unsigned, 1 for signed
     pixel_representation: PixelRepresentation,
-    // Enhanced MR Images are not yet supported having
-    // a RescaleSlope/RescaleIntercept Per-Frame Functional Group
-    /// the pixel value rescale intercept
-    rescale_intercept: f64,
-    /// the pixel value rescale slope
-    rescale_slope: f64,
+    /// Multiframe dicom objects can have rescale information, voi LUT and
+    /// window level information once in the shared functional group sequence,
+    /// or multiple times in the per-frame functional group sequence. This is a
+    /// vector of intercepts and slopes, one for each frame.
+    /// 
+    /// the pixel value rescale slope and intercept
+    rescale: Vec<Rescale>,
     // the VOI LUT function
-    voi_lut_function: Option<VoiLutFunction>,
+    voi_lut_function: Option<Vec<VoiLutFunction>>,
     /// the window level specified via width and center
-    window: Option<WindowLevel>,
-    // TODO(#232): VOI LUT sequence is currently not supported
+    window: Option<Vec<WindowLevel>>,
+
+    /// Enforce frame funcional groups VMs match `number_of_frames`
+    enforce_frame_fg_vm_match: bool,
 }
 
 impl DecodedPixelData<'_> {
@@ -532,17 +560,73 @@ impl DecodedPixelData<'_> {
 
     /// Retrieve object's rescale parameters.
     #[inline]
-    pub fn rescale(&self) -> Rescale {
-        Rescale {
-            intercept: self.rescale_intercept,
-            slope: self.rescale_slope,
+    pub fn rescale(&self) -> Result<&[Rescale]> {
+        match &self.rescale.len() {
+            0 => Ok(&[Rescale { slope: 1., intercept: 0. }]),
+            1 => Ok(&self.rescale),
+            len @ _ => {
+                if *len == self.number_of_frames as usize {
+                    Ok(&self.rescale)
+                } else {
+                    if self.enforce_frame_fg_vm_match{
+                        LengthMismatchRescaleSnafu{slope_vm: *len as u32, intercept_vm: *len as u32}.fail()?
+                    }
+                    tracing::warn!("Expected `{:?}` rescale parameters, found `{:?}`, using first value for all", self.number_of_frames, len);
+                    Ok(&self.rescale[0..0])
+                }
+            }
         }
     }
 
     /// Retrieve the VOI LUT function defined by the object, if any.
     #[inline]
-    pub fn voi_lut_function(&self) -> Option<VoiLutFunction> {
-        self.voi_lut_function
+    pub fn voi_lut_function(&self) -> Result<Option<&[VoiLutFunction]>> {
+        if let Some(inner) = &self.voi_lut_function {
+            let res = match &inner.len() {
+                0 => Ok(None),
+                1 => Ok(Some(inner.as_slice())),
+                len @ _ => {
+                    if *len == self.number_of_frames as usize {
+                        Ok(Some(inner.as_slice()))
+                    } else {
+                        if self.enforce_frame_fg_vm_match{
+                            LengthMismatchVoiLutFunctionSnafu{vm: *len as u32, nr_frames: self.number_of_frames}.fail()?
+                        }
+                        tracing::warn!("Expected `{:?}` VOI LUT functions, found `{:?}`, using first value for all", self.number_of_frames, len);
+                        Ok(Some(&inner[0..0]))
+                    }
+                }
+            };
+            res
+
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline]
+    pub fn window(&self) -> Result<Option<&[WindowLevel]>> {
+        if let Some(inner) = &self.window {
+            let res = match &inner.len() {
+                0 => Ok(None),
+                1 => Ok(Some(inner.as_slice())),
+                len @ _ => {
+                    if *len == self.number_of_frames as usize {
+                        Ok(Some(inner.as_slice()))
+                    } else {
+                        if self.enforce_frame_fg_vm_match{
+                            LengthMismatchWindowLevelSnafu{ww_vm: *len as u32, wc_vm: *len as u32}.fail()?
+                        }
+                        tracing::warn!("Expected `{:?}` Window Levels, found `{:?}`, using first value for all", self.number_of_frames, len);
+                        Ok(Some(&inner[0..0]))
+                    }
+                }
+            };
+            res
+
+        } else {
+            Ok(None)
+        }
     }
 
     // converter methods
@@ -807,15 +891,20 @@ impl DecodedPixelData<'_> {
                     }
                     // other
                     ModalityLutOption::Default | ModalityLutOption::Override(..) => {
-                        let rescale = if let ModalityLutOption::Override(rescale) = modality_lut {
-                            *rescale
-                        } else {
-                            self.rescale()
+                        let rescale = {
+                            let default = self.rescale()?;
+                            if let ModalityLutOption::Override(rescale) = modality_lut {
+                                *rescale
+                            } else if default.len() > 1 {
+                                default[frame as usize]
+                            } else {
+                                default[0]
+                            }
                         };
 
                         let signed = self.pixel_representation == PixelRepresentation::Signed;
 
-                        let lut: Lut<u8> = match (voi_lut, self.window) {
+                        let lut: Lut<u8> = match (voi_lut, self.window()?) {
                             (VoiLutOption::Identity, _) => {
                                 Lut::new_rescale(8, false, rescale).context(CreateLutSnafu)?
                             }
@@ -825,8 +914,11 @@ impl DecodedPixelData<'_> {
                                     signed,
                                     rescale,
                                     WindowLevelTransform::new(
-                                        self.voi_lut_function.unwrap_or_default(),
-                                        window,
+                                        match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
+                                        if window.len() > 1 {window[frame as usize]} else {window[0]},
                                     ),
                                 )
                                 .context(CreateLutSnafu)?
@@ -846,7 +938,10 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
+                                    match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
                                     *window,
                                 ),
                             )
@@ -913,10 +1008,15 @@ impl DecodedPixelData<'_> {
                     }
 
                     ModalityLutOption::Default | ModalityLutOption::Override(..) => {
-                        let rescale = if let ModalityLutOption::Override(rescale) = modality_lut {
-                            *rescale
-                        } else {
-                            Rescale::new(self.rescale_slope, self.rescale_intercept)
+                        let rescale = {
+                            let default = self.rescale()?;
+                            if let ModalityLutOption::Override(rescale) = modality_lut {
+                                *rescale
+                            } else if default.len() > 1 {
+                                self.rescale[frame as usize]
+                            } else {
+                                default[0]
+                            }
                         };
 
                         // fetch pixel data as a slice of u16 values,
@@ -929,7 +1029,7 @@ impl DecodedPixelData<'_> {
                         let samples = self.frame_data_ow(frame)?;
 
                         // use 16-bit precision to prevent possible loss of precision in image
-                        let lut: Lut<u16> = match (voi_lut, self.window) {
+                        let lut: Lut<u16> = match (voi_lut, self.window()?) {
                             (VoiLutOption::Identity, _) => {
                                 Lut::new_rescale(self.bits_stored, signed, rescale)
                             }
@@ -939,8 +1039,11 @@ impl DecodedPixelData<'_> {
                                     signed,
                                     rescale,
                                     WindowLevelTransform::new(
-                                        self.voi_lut_function.unwrap_or_default(),
-                                        window,
+                                        match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
+                                        if window.len() > 1 {window[frame as usize]} else {window[0]},
                                     ),
                                 )
                             }
@@ -959,7 +1062,10 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
+                                        match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
                                     *window,
                                 ),
                             ),
@@ -1027,7 +1133,12 @@ impl DecodedPixelData<'_> {
         T: Send + Sync,
         T: Copy,
     {
-        self.convert_pixel_slice(&self.data[..], &Default::default())
+        let mut res: Vec<T> = Vec::new();
+        for frame in 0..self.number_of_frames{
+            let frame_data: Vec<T> = self.convert_pixel_slice(self.frame_data(frame)?, frame, &Default::default())?;
+            res.extend(frame_data)
+        }
+        Ok(res)
     }
 
     /// Convert all of the decoded pixel data into a vector of flat pixels
@@ -1051,7 +1162,12 @@ impl DecodedPixelData<'_> {
         T: Send + Sync,
         T: Copy,
     {
-        self.convert_pixel_slice(&self.data[..], options)
+        let mut res: Vec<T> = Vec::new();
+        for frame in 0..self.number_of_frames{
+            let frame_data: Vec<T> = self.convert_pixel_slice(self.frame_data(frame)?, frame, options)?;
+            res.extend(frame_data)
+        }
+        Ok(res)
     }
 
     /// Convert the decoded pixel data of a frame
@@ -1075,7 +1191,7 @@ impl DecodedPixelData<'_> {
         T: Send + Sync,
         T: Copy,
     {
-        self.convert_pixel_slice(self.frame_data(frame)?, &Default::default())
+        self.convert_pixel_slice(self.frame_data(frame)?, frame, &Default::default())
     }
 
     /// Convert the decoded pixel data of a frame
@@ -1126,12 +1242,13 @@ impl DecodedPixelData<'_> {
         T: Send + Sync,
         T: Copy,
     {
-        self.convert_pixel_slice(self.frame_data(frame)?, options)
+        self.convert_pixel_slice(self.frame_data(frame)?, frame, options)
     }
 
     fn convert_pixel_slice<T: 'static>(
         &self,
         data: &[u8],
+        frame: u32,
         options: &ConvertOptions,
     ) -> Result<Vec<T>>
     where
@@ -1161,14 +1278,19 @@ impl DecodedPixelData<'_> {
                     ModalityLutOption::Default | ModalityLutOption::Override(_)
                         if self.photometric_interpretation.is_monochrome() =>
                     {
-                        let rescale = if let ModalityLutOption::Override(rescale) = modality_lut {
-                            *rescale
-                        } else {
-                            self.rescale()
+                        let rescale = {
+                            let default = self.rescale()?;
+                            if let ModalityLutOption::Override(rescale) = modality_lut {
+                                *rescale
+                            } else if default.len() > 1 {
+                                default[frame as usize]
+                            } else {
+                                default[0]
+                            }
                         };
                         let signed = self.pixel_representation == PixelRepresentation::Signed;
 
-                        let lut: Lut<T> = match (voi_lut, self.window) {
+                        let lut: Lut<T> = match (voi_lut, self.window()?) {
                             (VoiLutOption::Default | VoiLutOption::Identity, _) => {
                                 Lut::new_rescale(8, signed, rescale)
                             }
@@ -1177,8 +1299,11 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
-                                    window,
+                                        match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
+                                   if window.len() > 1 { window[frame as usize]} else { window[0] },
                                 ),
                             ),
                             (VoiLutOption::First, None) => {
@@ -1190,7 +1315,10 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
+                                        match self.voi_lut_function()? {
+                                            Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                            None => VoiLutFunction::Linear,
+                                        },
                                     *window,
                                 ),
                             ),
@@ -1235,15 +1363,20 @@ impl DecodedPixelData<'_> {
                     {
                         let samples = bytes_to_vec_u16(data);
 
-                        let rescale = if let ModalityLutOption::Override(rescale) = modality_lut {
-                            *rescale
-                        } else {
-                            self.rescale()
+                        let rescale = {
+                            let default = self.rescale()?;
+                            if let ModalityLutOption::Override(rescale) = modality_lut {
+                                *rescale
+                            } else if default.len() > 1 {
+                                default[frame as usize]
+                            } else {
+                                default[0]
+                            }
                         };
 
                         let signed = self.pixel_representation == PixelRepresentation::Signed;
 
-                        let lut: Lut<T> = match (voi_lut, self.window) {
+                        let lut: Lut<T> = match (voi_lut, self.window()?) {
                             (VoiLutOption::Default | VoiLutOption::Identity, _) => {
                                 Lut::new_rescale(self.bits_stored, signed, rescale)
                             }
@@ -1252,8 +1385,11 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
-                                    window,
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                        None => VoiLutFunction::Linear,
+                                    },
+                                    if window.len() > 1 {window[frame as usize]} else {window[0]},
                                 ),
                             ),
                             (VoiLutOption::First, None) => {
@@ -1270,7 +1406,10 @@ impl DecodedPixelData<'_> {
                                 signed,
                                 rescale,
                                 WindowLevelTransform::new(
-                                    self.voi_lut_function.unwrap_or_default(),
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => if lut.len() > 1 {lut[frame as usize]} else {lut[0]},
+                                        None => VoiLutFunction::Linear,
+                                    },
                                     *window,
                                 ),
                             ),
@@ -1527,10 +1666,10 @@ impl DecodedPixelData<'_> {
             rows: self.rows,
             cols: self.cols,
             samples_per_pixel: self.samples_per_pixel,
-            rescale_intercept: self.rescale_intercept,
-            rescale_slope: self.rescale_slope,
-            voi_lut_function: self.voi_lut_function,
-            window: self.window,
+            rescale: self.rescale.to_vec(),
+            voi_lut_function: self.voi_lut_function.clone(),
+            window: self.window.clone(),
+            enforce_frame_fg_vm_match: self.enforce_frame_fg_vm_match,
         }
     }
 }
@@ -1697,49 +1836,70 @@ pub(crate) struct ImagingProperties {
     pub(crate) pixel_representation: PixelRepresentation,
     pub(crate) planar_configuration: PlanarConfiguration,
     pub(crate) photometric_interpretation: PhotometricInterpretation,
-    pub(crate) rescale_intercept: f64,
-    pub(crate) rescale_slope: f64,
+    pub(crate) rescale_intercept: Vec<f64>,
+    pub(crate) rescale_slope: Vec<f64>,
     pub(crate) number_of_frames: u32,
-    pub(crate) voi_lut_function: Option<VoiLutFunction>,
-    pub(crate) window: Option<WindowLevel>,
+    pub(crate) voi_lut_function: Option<Vec<VoiLutFunction>>,
+    pub(crate) window: Option<Vec<WindowLevel>>,
 }
 
 #[cfg(not(feature = "gdcm"))]
 impl ImagingProperties {
     fn from_obj<D>(
         obj: &FileDicomObject<InMemDicomObject<D>>,
-    ) -> Result<Self, attribute::GetAttributeError>
+    ) -> Result<Self>
     where
         D: Clone + DataDictionary,
     {
         use attribute::*;
         use std::convert::TryFrom;
 
-        let cols = cols(obj)?;
-        let rows = rows(obj)?;
-        let photometric_interpretation = photometric_interpretation(obj)?;
-        let samples_per_pixel = samples_per_pixel(obj)?;
-        let planar_configuration = planar_configuration(obj)?;
-        let bits_allocated = bits_allocated(obj)?;
-        let bits_stored = bits_stored(obj)?;
-        let high_bit = high_bit(obj)?;
-        let pixel_representation = pixel_representation(obj)?;
+        let cols = cols(obj).context(GetAttributeSnafu)?;
+        let rows = rows(obj).context(GetAttributeSnafu)?;
+        let photometric_interpretation = photometric_interpretation(obj).context(GetAttributeSnafu)?;
+        let samples_per_pixel = samples_per_pixel(obj).context(GetAttributeSnafu)?;
+        let planar_configuration = planar_configuration(obj).context(GetAttributeSnafu)?;
+        let bits_allocated = bits_allocated(obj).context(GetAttributeSnafu)?;
+        let bits_stored = bits_stored(obj).context(GetAttributeSnafu)?;
+        let high_bit = high_bit(obj).context(GetAttributeSnafu)?;
+        let pixel_representation = pixel_representation(obj).context(GetAttributeSnafu)?;
         let rescale_intercept = rescale_intercept(obj);
         let rescale_slope = rescale_slope(obj);
-        let number_of_frames = number_of_frames(obj)?;
-        let voi_lut_function = voi_lut_function(obj)?;
-        let voi_lut_function = voi_lut_function.and_then(|v| VoiLutFunction::try_from(&*v).ok());
+        let number_of_frames = number_of_frames(obj).context(GetAttributeSnafu)?;
+        let voi_lut_function = voi_lut_function(obj).context(GetAttributeSnafu)?;
+        let voi_lut_function: Option<Vec<VoiLutFunction>> = voi_lut_function.
+            and_then(|fns| fns.iter()
+                .map(|v| VoiLutFunction::try_from((*v).as_str()).ok())
+                .collect()
+            );
 
-        let window = if let Some(window_center) = window_center(obj)? {
-            let window_width = window_width(obj)?;
+        ensure!(
+            rescale_intercept.len() == rescale_slope.len(), LengthMismatchRescaleSnafu {
+            slope_vm: rescale_slope.len() as u32,
+            intercept_vm: rescale_intercept.len() as u32,
+        });
 
-            window_width.map(|width| WindowLevel {
-                center: window_center,
-                width,
-            })
+        let window = if let Some(wcs) = window_center(obj) {
+            let width = window_width(obj);
+            if let Some(wws) = width {
+                ensure!(wcs.len() == wws.len(), LengthMismatchWindowLevelSnafu {
+                    wc_vm: wcs.len() as u32,
+                    ww_vm: wws.len() as u32,
+                });
+                Some(zip(wcs, wws)
+                    .map(|(wc, ww)| WindowLevel {
+                        center: wc,
+                        width: ww,
+                    })
+                    .collect())
+            }
+            else {
+                None
+            }
         } else {
             None
         };
+
 
         Ok(Self {
             cols,
@@ -1783,7 +1943,7 @@ where
             number_of_frames,
             voi_lut_function,
             window,
-        } = ImagingProperties::from_obj(self).context(GetAttributeSnafu)?;
+        } = ImagingProperties::from_obj(self)?;
 
         let transfer_syntax = &self.meta().transfer_syntax;
         let ts = TransferSyntaxRegistry
@@ -1798,6 +1958,10 @@ where
             }
             .fail()?;
         }
+
+        let rescale = zip(&rescale_intercept, &rescale_slope)
+            .map(|(intercept, slope)| Rescale { intercept: *intercept, slope: *slope })
+            .collect();
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
@@ -1826,24 +1990,24 @@ where
                 bits_stored,
                 high_bit,
                 pixel_representation,
-                rescale_intercept,
-                rescale_slope,
+                rescale,
                 voi_lut_function,
                 window,
+                enforce_frame_fg_vm_match: false,
             });
         }
 
         let decoded_pixel_data = match pixel_data.value() {
-            Value::PixelSequence(v) => {
+            DicomValue::PixelSequence(v) => {
                 // Return all fragments concatenated
                 // (should only happen for Encapsulated Uncompressed)
                 v.fragments().iter().flatten().copied().collect()
             }
-            Value::Primitive(p) => {
+            DicomValue::Primitive(p) => {
                 // Non-encoded, just return the pixel data for all frames
                 p.to_bytes().to_vec()
             }
-            Value::Sequence(..) => InvalidPixelDataSnafu.fail()?,
+            DicomValue::Sequence(..) => InvalidPixelDataSnafu.fail()?,
         };
 
         Ok(DecodedPixelData {
@@ -1858,10 +2022,10 @@ where
             bits_stored,
             high_bit,
             pixel_representation,
-            rescale_intercept,
-            rescale_slope,
+            rescale,
             voi_lut_function,
             window,
+            enforce_frame_fg_vm_match: false,
         })
     }
 
@@ -1883,7 +2047,7 @@ where
             number_of_frames,
             voi_lut_function,
             window,
-        } = ImagingProperties::from_obj(self).context(GetAttributeSnafu)?;
+        } = ImagingProperties::from_obj(self)?;
 
         let transfer_syntax = &self.meta().transfer_syntax;
         let ts = TransferSyntaxRegistry
@@ -1898,6 +2062,10 @@ where
             }
             .fail()?;
         }
+
+        let rescale = zip(&rescale_intercept, &rescale_slope)
+            .map(|(intercept, slope)| Rescale { intercept: *intercept, slope: *slope })
+            .collect();
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
@@ -1926,15 +2094,15 @@ where
                 bits_stored,
                 high_bit,
                 pixel_representation,
-                rescale_intercept,
-                rescale_slope,
+                rescale,
                 voi_lut_function,
                 window,
+                enforce_frame_fg_vm_match: false,
             });
         }
 
         let decoded_pixel_data = match pixel_data.value() {
-            Value::PixelSequence(v) => {
+            DicomValue::PixelSequence(v) => {
                 let fragments = v.fragments();
                 if number_of_frames as usize == fragments.len() {
                     // return a single fragment
@@ -1944,7 +2112,7 @@ where
                     InvalidPixelDataSnafu.fail()?
                 }
             }
-            Value::Primitive(p) => {
+            DicomValue::Primitive(p) => {
                 // Non-encoded, just return the pixel data for a single frame
                 let frame_size = ((bits_allocated + 7) / 8) as usize
                     * samples_per_pixel as usize
@@ -1954,7 +2122,7 @@ where
                 let data = p.to_bytes();
                 data[frame_offset..frame_offset + frame_size].to_vec()
             }
-            Value::Sequence(..) => InvalidPixelDataSnafu.fail()?,
+            DicomValue::Sequence(..) => InvalidPixelDataSnafu.fail()?,
         };
 
         Ok(DecodedPixelData {
@@ -1969,10 +2137,10 @@ where
             bits_stored,
             high_bit,
             pixel_representation,
-            rescale_intercept,
-            rescale_slope,
+            rescale,
             voi_lut_function,
             window,
+            enforce_frame_fg_vm_match: false,
         })
     }
 }
@@ -1981,7 +2149,6 @@ where
 mod tests {
     use super::*;
     use dicom_object::open_file;
-    use dicom_test_files;
 
     fn is_send_and_sync<T>()
     where
@@ -2085,7 +2252,7 @@ mod tests {
         let test_file = dicom_test_files::path("pydicom/CT_small.dcm").unwrap();
         let obj = open_file(test_file).unwrap();
         let pixel_data = obj.decode_pixel_data().unwrap();
-        assert_eq!(pixel_data.rescale(), Rescale::new(1., -1024.));
+        assert_eq!(pixel_data.rescale().unwrap()[0], Rescale::new(1., -1024.));
     }
 
     #[test]
@@ -2094,7 +2261,7 @@ mod tests {
         let test_file = dicom_test_files::path("pydicom/MR_small.dcm").unwrap();
         let obj = open_file(test_file).unwrap();
         let pixel_data = obj.decode_pixel_data().unwrap();
-        assert_eq!(pixel_data.rescale(), Rescale::new(1., 0.));
+        assert_eq!(pixel_data.rescale().unwrap()[0], Rescale::new(1., 0.));
     }
 
     #[test]
@@ -2227,16 +2394,17 @@ mod tests {
     #[cfg(not(feature = "gdcm"))]
     mod not_gdcm {
         #[cfg(any(feature = "transfer-syntax-registry/rle", feature = "image"))]
-        use super::*;
         #[cfg(feature = "image")]
         use rstest::rstest;
+        #[cfg(feature = "ndarray")]
+        use crate::PixelDecoder;
 
         #[cfg(feature = "transfer-syntax-registry/rle")]
         #[test]
         fn test_native_decoding_pixel_data_rle_8bit_1frame_vec() {
             let path = dicom_test_files::path("pydicom/SC_rgb_rle.dcm")
                 .expect("test DICOM file should exist");
-            let object = open_file(&path).unwrap();
+            let object = dicom_object::open_file(&path).unwrap();
 
             let options = ConvertOptions::new().with_modality_lut(ModalityLutOption::None);
             let decoded = object.decode_pixel_data().unwrap();
@@ -2274,9 +2442,11 @@ mod tests {
         #[cfg(feature = "ndarray")]
         #[test]
         fn test_native_decoding_pixel_data_rle_8bit_1frame_ndarray() {
+            use crate::{ConvertOptions, ModalityLutOption};
+
             let path = dicom_test_files::path("pydicom/SC_rgb_rle.dcm")
                 .expect("test DICOM file should exist");
-            let object = open_file(&path).unwrap();
+            let object = dicom_object::open_file(&path).unwrap();
 
             let options = ConvertOptions::new().with_modality_lut(ModalityLutOption::None);
             let ndarray = object
@@ -2308,9 +2478,11 @@ mod tests {
         #[cfg(feature = "ndarray")]
         #[test]
         fn test_native_decoding_pixel_data_rle_8bit_2frame() {
+            use crate::{ConvertOptions, ModalityLutOption};
+
             let path = dicom_test_files::path("pydicom/SC_rgb_rle_2frame.dcm")
                 .expect("test DICOM file should exist");
-            let object = open_file(&path).unwrap();
+            let object = dicom_object::open_file(&path).unwrap();
             let options = ConvertOptions::new().with_modality_lut(ModalityLutOption::None);
             let ndarray = object
                 .decode_pixel_data()
@@ -2358,9 +2530,11 @@ mod tests {
         #[cfg(feature = "ndarray")]
         #[test]
         fn test_native_decoding_pixel_data_rle_16bit_1frame() {
+            use crate::{ConvertOptions, ModalityLutOption};
+
             let path = dicom_test_files::path("pydicom/SC_rgb_rle_16bit.dcm")
                 .expect("test DICOM file should exist");
-            let object = open_file(&path).unwrap();
+            let object = dicom_object::open_file(&path).unwrap();
             let options = ConvertOptions::new().with_modality_lut(ModalityLutOption::None);
             let ndarray = object
                 .decode_pixel_data()
@@ -2392,7 +2566,7 @@ mod tests {
         fn test_native_decoding_pixel_data_rle_16bit_2frame() {
             let path = dicom_test_files::path("pydicom/SC_rgb_rle_16bit_2frame.dcm")
                 .expect("test DICOM file should exist");
-            let object = open_file(&path).unwrap();
+            let object = dicom_object::open_file(&path).unwrap();
             let ndarray = object
                 .decode_pixel_data()
                 .unwrap()
@@ -2471,10 +2645,11 @@ mod tests {
         fn test_parse_jpeg_encoded_dicom_pixel_data(#[case] value: &str, #[case] frames: u32) {
             use std::fs;
             use std::path::Path;
+            use crate::PixelDecoder as _;
 
             let test_file = dicom_test_files::path(value).unwrap();
             println!("Parsing pixel data for {}", test_file.display());
-            let obj = open_file(test_file).unwrap();
+            let obj = dicom_object::open_file(test_file).unwrap();
             let pixel_data = obj.decode_pixel_data().unwrap();
             assert_eq!(pixel_data.number_of_frames(), frames, "number of frames mismatch");
 
@@ -2505,9 +2680,11 @@ mod tests {
         #[case("pydicom/JPEG2000_UNC.dcm", 0)]
         fn test_decode_pixel_data_individual_frames(#[case] value: &str, #[case] frame: u32) {
             use std::path::Path;
+            use crate::PixelDecoder as _;
+
             let test_file = dicom_test_files::path(value).unwrap();
             println!("Parsing pixel data for {}", test_file.display());
-            let obj = open_file(test_file).unwrap();
+            let obj = dicom_object::open_file(test_file).unwrap();
             let pixel_data = obj.decode_pixel_data_frame(frame).unwrap();
             let output_dir = Path::new(
                 "../target/dicom_test_files/_out/test_decode_pixel_data_individual_frames",

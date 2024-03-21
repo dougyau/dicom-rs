@@ -872,7 +872,7 @@ where
         &self,
         selector: impl Into<AttributeSelector>,
     ) -> Result<&Value<InMemDicomObject<D>, InMemFragment>, AtAccessError> {
-        let selector = selector.into();
+        let selector: AttributeSelector = selector.into();
 
         let mut obj = self;
         for (i, step) in selector.iter().enumerate() {
@@ -1719,23 +1719,19 @@ fn even_len(l: u32) -> u32 {
 mod tests {
 
     use super::*;
-    use crate::AtAccessError;
-    use crate::{meta::FileMetaTableBuilder, open_file};
+    use crate::open_file;
     use byteordered::Endianness;
     use dicom_core::chrono::FixedOffset;
-    use dicom_core::ops::AttributeSelector;
-    use dicom_core::value::{DicomDate, DicomDateTime, DicomTime, PrimitiveValue};
+    use dicom_core::value::{DicomDate, DicomDateTime, DicomTime};
     use dicom_core::{
         dicom_value,
-        header::{DataElementHeader, Length, VR},
-        ops::{AttributeAction, AttributeOp},
+        header::DataElementHeader,
     };
     use dicom_encoding::{
         decode::{basic::BasicDecoder, implicit_le::ImplicitVRLittleEndianDecoder},
         encode::{implicit_le::ImplicitVRLittleEndianEncoder, EncoderFor},
     };
-    use dicom_parser::{dataset::IntoTokens, StatefulDecoder};
-    use tempfile;
+    use dicom_parser::StatefulDecoder;
 
     fn assert_obj_eq<D>(obj1: &InMemDicomObject<D>, obj2: &InMemDicomObject<D>)
     where
@@ -1937,7 +1933,7 @@ mod tests {
         obj.put(instance_number);
 
         // add a date time
-        let dt = DicomDateTime::from_date_and_time(
+        let dt = DicomDateTime::from_date_and_time_with_time_zone(
             DicomDate::from_ymd(2022, 11, 22).unwrap(),
             DicomTime::from_hms(18, 09, 35).unwrap(),
             FixedOffset::east_opt(3600).unwrap(),

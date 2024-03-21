@@ -6,7 +6,6 @@ use crate::value::{
     CastValueError, ConvertValueError, DataSetSequence, DicomDate, DicomDateTime, DicomTime,
     InMemFragment, PrimitiveValue, Value, C,
 };
-use chrono::FixedOffset;
 use num_traits::NumCast;
 use snafu::{ensure, Backtrace, Snafu};
 use std::borrow::Cow;
@@ -503,11 +502,8 @@ where
     ///
     /// Returns an error if the value is not primitive.
     ///
-    pub fn to_datetime(
-        &self,
-        default_offset: FixedOffset,
-    ) -> Result<DicomDateTime, ConvertValueError> {
-        self.value().to_datetime(default_offset)
+    pub fn to_datetime(&self) -> Result<DicomDateTime, ConvertValueError> {
+        self.value().to_datetime()
     }
 
     /// Retrieve and convert the primitive value into a sequence of date-times.
@@ -517,11 +513,8 @@ where
     ///
     /// Returns an error if the value is not primitive.
     ///
-    pub fn to_multi_datetime(
-        &self,
-        default_offset: FixedOffset,
-    ) -> Result<Vec<DicomDateTime>, ConvertValueError> {
-        self.value().to_multi_datetime(default_offset)
+    pub fn to_multi_datetime(&self) -> Result<Vec<DicomDateTime>, ConvertValueError> {
+        self.value().to_multi_datetime()
     }
 
     /// Retrieve the items stored in a sequence value.
@@ -1224,7 +1217,7 @@ impl PartialOrd<Length> for Length {
     }
 }
 
-impl ::std::ops::Add<Length> for Length {
+impl std::ops::Add<Length> for Length {
     type Output = Self;
 
     fn add(self, rhs: Length) -> Self::Output {
@@ -1242,7 +1235,7 @@ impl ::std::ops::Add<Length> for Length {
     }
 }
 
-impl ::std::ops::Add<i32> for Length {
+impl std::ops::Add<i32> for Length {
     type Output = Self;
 
     fn add(self, rhs: i32) -> Self::Output {
@@ -1364,11 +1357,7 @@ impl fmt::Display for Length {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        dicom_value,
-        value::{InMemFragment, PixelFragmentSequence},
-        DicomValue,
-    };
+    use crate::{dicom_value, value::PixelFragmentSequence, DicomValue};
 
     #[test]
     fn to_clean_string() {

@@ -1,6 +1,6 @@
 [package]
 name = "dicom-pixeldata"
-version = "0.2.2"
+version = "0.7.0"
 authors = ["Eduardo Pinho <enet4mikeenet@gmail.com>", "Peter Evers <pevers90@gmail.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
@@ -16,11 +16,11 @@ path = "src/bin/dicom-transcode.rs"
 required-features = ["cli"]
 
 [dependencies]
-dicom-object = { path = "../object", version = "0.6.3" }
-dicom-core = { path = "../core", version = "0.6.3" }
-dicom-encoding = { path = "../encoding", version = "0.6.1" }
-dicom-transfer-syntax-registry = { path = "../transfer-syntax-registry", version = "0.6.2" }
-dicom-dictionary-std = { path = "../dictionary-std", version = "0.6.1" }
+dicom-object = { path = "../object", version = "0.7.0" }
+dicom-core = { path = "../core", version = "0.7.0" }
+dicom-encoding = { path = "../encoding", version = "0.7.0" }
+dicom-transfer-syntax-registry = { path = "../transfer-syntax-registry", version = "0.7.0" }
+dicom-dictionary-std = { path = "../dictionary-std", version = "0.7.0" }
 snafu = "0.8"
 byteorder = "1.4.3"
 gdcm-rs = { version = "0.6", optional = true }
@@ -30,9 +30,9 @@ num-traits = "0.2.12"
 tracing = "0.1.34"
 
 [dependencies.image]
-version = "0.24.5"
+version = "0.25.1"
 default-features = false
-features = ["jpeg", "png", "pnm", "tiff", "webp", "bmp", "openexr"]
+features = ["jpeg", "png", "pnm", "tiff", "webp", "bmp", "exr"]
 optional = true
 
 [dependencies.clap]
@@ -45,8 +45,8 @@ version = "0.3.17"
 optional = true
 
 [dev-dependencies]
-rstest = "0.18.1"
-dicom-test-files = "0.2.1"
+rstest = "0.19"
+dicom-test-files = "0.3"
 
 [features]
 default = ["rayon", "native"]
@@ -68,7 +68,7 @@ openjp2 = ["dicom-transfer-syntax-registry/openjp2"]
 # replace pixel data decoding to use GDCM
 gdcm = ["gdcm-rs"]
 # use Rayon for image decoding
-rayon = ["dep:rayon", "image?/jpeg_rayon", "dicom-transfer-syntax-registry/rayon"]
+rayon = ["dep:rayon", "image?/rayon", "dicom-transfer-syntax-registry/rayon"]
 
 # enable command line tools
 cli = ["dep:clap", "dep:tracing-subscriber"]

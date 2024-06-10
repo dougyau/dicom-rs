@@ -12,7 +12,6 @@ use dicom_encoding::transfer_syntax::TransferSyntax;
 use snafu::{Backtrace, ResultExt, Snafu};
 use std::cmp::Ordering;
 use std::io::Read;
-use std::iter::Iterator;
 
 use super::{DataToken, SeqTokenType};
 
@@ -172,19 +171,23 @@ pub struct DataSetReader<S> {
 }
 
 impl<R> DataSetReader<DynStatefulDecoder<R>> {
-    /// Creates a new iterator with the given random access source,
-    /// while considering the given transfer syntax and specific character set.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `new_with_ts_cs` or `new_with_ts_cs_options` instead"
-    )]
-    pub fn new_with(source: R, ts: &TransferSyntax, cs: SpecificCharacterSet) -> Result<Self>
+    /// Create a new data set token reader with the given byte source,
+    /// while considering the given transfer syntax specifier.
+    #[inline]
+    pub fn new_with_ts(source: R, ts: &TransferSyntax) -> Result<Self>
     where
         R: Read,
     {
-        Self::new_with_ts_cs(source, ts, cs)
+        Self::new_with_ts_cs_options(source, ts, Default::default(), Default::default())
     }
 
+    /// Create a new data set token reader with the given byte source,
+    /// while considering the given transfer syntax specifier
+    /// and the specific character set to assume by default.
+    ///
+    /// Note that the data set being read
+    /// can override the character set with the presence of a
+    /// _Specific Character Set_ data element.
     #[inline]
     pub fn new_with_ts_cs(source: R, ts: &TransferSyntax, cs: SpecificCharacterSet) -> Result<Self>
     where
@@ -594,7 +597,7 @@ mod tests {
             &mut cursor,
             ImplicitVRLittleEndianDecoder::default(),
             LittleEndianBasicDecoder::default(),
-            SpecificCharacterSet::Default,
+            SpecificCharacterSet::default(),
         );
 
         validate_dataset_reader(data, parser, ground_truth)
@@ -609,7 +612,7 @@ mod tests {
             &mut cursor,
             ExplicitVRLittleEndianDecoder::default(),
             LittleEndianBasicDecoder::default(),
-            SpecificCharacterSet::Default,
+            SpecificCharacterSet::default(),
         );
 
         validate_dataset_reader(&data, parser, ground_truth)
@@ -1178,7 +1181,7 @@ mod tests {
             &mut cursor,
             ExplicitVRLittleEndianDecoder::default(),
             LittleEndianBasicDecoder::default(),
-            SpecificCharacterSet::Default,
+            SpecificCharacterSet::default(),
         );
         let mut dset_reader = DataSetReader::new(parser, Default::default());
 

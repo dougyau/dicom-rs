@@ -235,14 +235,27 @@ where
             0
         };
         let rescale_intercept = rescale_intercept(self);
+        let intercept = if let Some(intercept) = rescale_intercept.iter().nth(frame as usize) {
+            *intercept
+        } else {
+            *rescale_intercept.first().unwrap_or(&0.0)
+        };
         let rescale_slope = rescale_slope(self);
+        let slope = if let Some(slope) = rescale_slope.iter().nth(frame as usize) {
+            *slope
+        } else {
+            *rescale_slope.first().unwrap_or(&1.0)
+        };
+
         let number_of_frames = number_of_frames(self).context(GetAttributeSnafu)?;
-        let voi_lut_function = voi_lut_function(self).context(GetAttributeSnafu)?;
-        let voi_lut_function: Option<Vec<VoiLutFunction>> = voi_lut_function.and_then(|fns| {
-            fns.iter()
-                .map(|v| VoiLutFunction::try_from((*v).as_str()).ok())
-                .collect()
-        });
+        let voi_lut_function: Option<Vec<VoiLutFunction>> =
+            voi_lut_function(self).unwrap_or(None).and_then(|fns| {
+                fns.iter().nth(frame as usize).and_then(|v| {
+                    VoiLutFunction::try_from((*v).as_str())
+                        .ok()
+                        .map(|v| vec![v])
+                })
+            });
 
         let decoded_pixel_data = match pixel_data.value() {
             DicomValue::PixelSequence(v) => {
@@ -327,26 +340,22 @@ where
                         ww_vm: wws.len() as u32,
                     }
                 );
-                Some(
-                    zip(wcs, wws)
-                        .map(|(wc, ww)| WindowLevel {
+                zip(wcs, wws)
+                    .nth(frame as usize)
+                    .map(|(wc, ww)| {
+                        Some(vec![WindowLevel {
                             center: wc,
                             width: ww,
-                        })
-                        .collect(),
-                )
+                        }])
+                    })
+                    .unwrap_or_default()
             } else {
                 None
             }
         } else {
             None
         };
-        let rescale = zip(&rescale_intercept, &rescale_slope)
-            .map(|(intercept, slope)| Rescale {
-                intercept: *intercept,
-                slope: *slope,
-            })
-            .collect();
+        let rescale = Rescale { intercept, slope };
 
         Ok(DecodedPixelData {
             data: Cow::from(decoded_pixel_data),
@@ -360,7 +369,7 @@ where
             bits_stored,
             high_bit,
             pixel_representation,
-            rescale: rescale,
+            rescale: vec![rescale],
             voi_lut_function,
             window,
             enforce_frame_fg_vm_match: false,

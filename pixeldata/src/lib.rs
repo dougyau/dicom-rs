@@ -1172,11 +1172,9 @@ impl DecodedPixelData<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn to_vec<T: 'static>(&self) -> Result<Vec<T>>
+    pub fn to_vec<T>(&self) -> Result<Vec<T>>
     where
-        T: NumCast,
-        T: Send + Sync,
-        T: Copy,
+        T: NumCast + Send + Sync + Copy + 'static,
     {
         let mut res: Vec<T> = Vec::new();
         for frame in 0..self.number_of_frames {
@@ -1202,11 +1200,9 @@ impl DecodedPixelData<'_> {
     /// which transformations should be done to the pixel data
     /// (primarily Modality LUT function and VOI LUT function).
     /// By default, only the Modality LUT function is applied.
-    pub fn to_vec_with_options<T: 'static>(&self, options: &ConvertOptions) -> Result<Vec<T>>
+    pub fn to_vec_with_options<T>(&self, options: &ConvertOptions) -> Result<Vec<T>>
     where
-        T: NumCast,
-        T: Send + Sync,
-        T: Copy,
+        T: NumCast + Send + Sync + Copy + 'static,
     {
         let mut res: Vec<T> = Vec::new();
         for frame in 0..self.number_of_frames {
@@ -1232,11 +1228,9 @@ impl DecodedPixelData<'_> {
     /// applies only the Modality LUT function.
     /// To change this behavior,
     /// see [`to_vec_frame_with_options`](Self::to_vec_frame_with_options).
-    pub fn to_vec_frame<T: 'static>(&self, frame: u32) -> Result<Vec<T>>
+    pub fn to_vec_frame<T>(&self, frame: u32) -> Result<Vec<T>>
     where
-        T: NumCast,
-        T: Send + Sync,
-        T: Copy,
+        T: NumCast + Send + Sync + Copy + 'static,
     {
         self.convert_pixel_slice(self.frame_data(frame)?, frame, &Default::default())
     }
@@ -1279,29 +1273,25 @@ impl DecodedPixelData<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn to_vec_frame_with_options<T: 'static>(
+    pub fn to_vec_frame_with_options<T>(
         &self,
         frame: u32,
         options: &ConvertOptions,
     ) -> Result<Vec<T>>
     where
-        T: NumCast,
-        T: Send + Sync,
-        T: Copy,
+        T: NumCast + Send + Sync + Copy + 'static,
     {
         self.convert_pixel_slice(self.frame_data(frame)?, frame, options)
     }
 
-    fn convert_pixel_slice<T: 'static>(
+    fn convert_pixel_slice<T>(
         &self,
         data: &[u8],
         frame: u32,
         options: &ConvertOptions,
     ) -> Result<Vec<T>>
     where
-        T: NumCast,
-        T: Send + Sync,
-        T: Copy,
+        T: NumCast + Send + Sync + Copy + 'static,
     {
         let ConvertOptions {
             modality_lut,
@@ -2482,13 +2472,15 @@ mod tests {
     mod not_gdcm {
         #[cfg(feature = "ndarray")]
         use crate::PixelDecoder;
-        #[cfg(any(feature = "transfer-syntax-registry/rle", feature = "image"))]
+        #[cfg(any(feature = "rle", feature = "image"))]
         #[cfg(feature = "image")]
         use rstest::rstest;
 
-        #[cfg(feature = "transfer-syntax-registry/rle")]
+        #[cfg(feature = "rle")]
         #[test]
         fn test_native_decoding_pixel_data_rle_8bit_1frame_vec() {
+            use crate::{ConvertOptions, ModalityLutOption, PixelDecoder as _};
+
             let path = dicom_test_files::path("pydicom/SC_rgb_rle.dcm")
                 .expect("test DICOM file should exist");
             let object = dicom_object::open_file(&path).unwrap();

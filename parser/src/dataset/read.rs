@@ -268,7 +268,6 @@ where
         if self.delimiter_check_pending {
             match self.update_seq_delimiters() {
                 Err(e) => {
-                    self.hard_break = true;
                     return Some(Err(e));
                 }
                 Ok(Some(token)) => return Some(Ok(token)),
@@ -557,6 +556,7 @@ where
                         return Ok(Some(token));
                     }
                     Ordering::Less => {
+                        self.seq_delimiters.pop();
                         return InconsistentSequenceEndSnafu {
                             end_of_sequence,
                             bytes_read,

@@ -47,7 +47,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::{collections::BTreeMap, io::Write};
-
+use tracing::warn;
 use crate::file::ReadPreamble;
 use crate::ops::{
     ApplyError, ApplyResult, IncompatibleTypesSnafu, ModifySnafu, UnsupportedActionSnafu,
@@ -1882,13 +1882,18 @@ where
                     }
 
                     // delegate sequence building to another function
-                    let items = Self::build_sequence(tag, len, &mut *dataset, &dict)?;
-                    DataElement::new_with_len(
-                        tag,
-                        VR::SQ,
-                        len,
-                        Value::Sequence(DataSetSequence::new(items, len)),
-                    )
+                    match Self::build_sequence(tag, len, &mut *dataset, &dict) {
+                        Ok(items) => DataElement::new_with_len(
+                            tag,
+                            VR::SQ,
+                            len,
+                            Value::Sequence(DataSetSequence::new(items, len)),
+                        ),
+                        Err(error) => {
+                            warn!(?error, "Invalid sequence");
+                            continue
+                        }
+                    }
                 }
                 DataToken::ItemEnd if in_item => {
                     // end of item, leave now

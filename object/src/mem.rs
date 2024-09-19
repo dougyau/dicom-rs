@@ -36,18 +36,6 @@
 //! If necessary, this number can be obtained via the [`HasLength`] trait.
 //! However, any modifications made to the object will reset this length
 //! to [_undefined_](dicom_core::Length::UNDEFINED).
-use dicom_core::ops::{
-    ApplyOp, AttributeAction, AttributeOp, AttributeSelector, AttributeSelectorStep,
-};
-use itertools::Itertools;
-use smallvec::SmallVec;
-use snafu::{ensure, OptionExt, ResultExt};
-use std::borrow::Cow;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
-use std::{collections::BTreeMap, io::Write};
-use tracing::warn;
 use crate::file::ReadPreamble;
 use crate::ops::{
     ApplyError, ApplyResult, IncompatibleTypesSnafu, ModifySnafu, UnsupportedActionSnafu,
@@ -65,6 +53,9 @@ use crate::{
 };
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::{GroupNumber, HasLength, Header};
+use dicom_core::ops::{
+    ApplyOp, AttributeAction, AttributeOp, AttributeSelector, AttributeSelectorStep,
+};
 use dicom_core::value::{DataSetSequence, PixelFragmentSequence, Value, ValueType, C};
 use dicom_core::{DataElement, Length, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, StandardDataDictionary};
@@ -76,6 +67,15 @@ use dicom_parser::{
     StatefulDecode,
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use itertools::Itertools;
+use smallvec::SmallVec;
+use snafu::{ensure, OptionExt, ResultExt};
+use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
+use std::{collections::BTreeMap, io::Write};
+use tracing::warn;
 
 /// A full in-memory DICOM data element.
 pub type InMemElement<D = StandardDataDictionary> = DataElement<InMemDicomObject<D>, InMemFragment>;
@@ -1889,9 +1889,9 @@ where
                             len,
                             Value::Sequence(DataSetSequence::new(items, len)),
                         ),
-                        Err(error) => {
-                            warn!(?error, "Invalid sequence");
-                            continue
+                        Err(_) => {
+                            warn!("Invalid sequence: ({:04x},{:04x})", tag.0, tag.1);
+                            continue;
                         }
                     }
                 }

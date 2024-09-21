@@ -1,5 +1,6 @@
 //! SOP class dictionary implementation
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use dicom_core::dictionary::{UidDictionary, UidDictionaryEntryRef};
@@ -97,6 +98,13 @@ fn init_dictionary() -> StandardUidRegistry {
     // only index SOP classes in this one
     d.index_all(SOP_CLASSES);
     d
+}
+
+pub fn get_all_sop_classes<'a>() -> Vec<Cow<'a, str>> {
+    SOP_CLASSES
+        .iter()
+        .map(|sop_class| Cow::from(sop_class.uid))
+        .collect()
 }
 
 #[cfg(test)]

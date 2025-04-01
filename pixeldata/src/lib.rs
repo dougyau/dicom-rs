@@ -105,13 +105,15 @@
 use byteorder::{ByteOrder, NativeEndian};
 #[cfg(not(feature = "gdcm"))]
 use dicom_core::{DataDictionary, DicomValue};
+use dicom_dictionary_std::tags;
 use dicom_encoding::adapters::DecodeError;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::Codec;
 #[cfg(not(feature = "gdcm"))]
-use dicom_object::{FileDicomObject, InMemDicomObject};
+use dicom_object::FileDicomObject;
+use dicom_object::InMemDicomObject;
 #[cfg(not(feature = "gdcm"))]
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 #[cfg(feature = "image")]
@@ -129,6 +131,7 @@ use snafu::ensure;
 use snafu::OptionExt;
 use snafu::{Backtrace, ResultExt, Snafu};
 use std::borrow::Cow;
+use std::convert::TryFrom;
 #[cfg(not(feature = "gdcm"))]
 use std::iter::zip;
 
@@ -339,6 +342,251 @@ pub enum ModalityLutOption {
     /// and apply the VOI LUT transformations as normal,
     /// use the `Override` variant instead.
     None,
+}
+
+/// Value of Interest (VOI) LUT (Look-Up Table) representation.
+///
+/// A VOI LUT maps input pixel values to output display values,
+/// allowing for transformations like window leveling or intensity scaling.
+///
+/// The `VoiLut` struct contains metadata and the LUT data itself.
+/// The LUT is represented as a list of mapped values in the appropriate type.
+#[derive(Clone, Debug)]
+pub struct VoiLut<T> {
+    /// The first pixel value mapped by this LUT.
+    first_mapped_value: u16,
+    /// The last pixel value mapped by this LUT.
+    last_mapped_value: u16,
+    /// The minimum value in the LUT data.
+    min_value: T,
+    /// The maximum value in the LUT data.
+    max_value: T,
+    /// The actual LUT data, containing the mapped pixel values.
+    lut_data: Vec<T>,
+}
+
+impl TryFrom<&InMemDicomObject> for VoiLut<i8> {
+    type Error = String;
+
+    /// Attempts to create a signed 8-bit VOI LUT (`VoiLut<i8>`) from an in-memory DICOM object.
+    ///
+    /// # Errors
+    /// Returns an error if the LUT is not signed or if the VOI LUT data cannot be properly extracted.
+    fn try_from(value: &InMemDicomObject) -> Result<Self, Self::Error> {
+        let (lut_length, first_mapped_value, _bits_stored, is_signed, lut_data) =
+            Self::get_lut_data(value)?;
+
+        // Verify the LUT is signed
+        if !is_signed {
+            return Err("LUT is not signed".into());
+        }
+
+        // Parse LUT data depending on its length
+        let lut_data = if lut_length * 2 == lut_data.len() {
+            lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_i16)
+                .map(|x| x as i8)
+                .collect()
+        } else {
+            let data: &[i8] = bytemuck::cast_slice(&lut_data);
+            data.to_vec()
+        };
+
+        // Construct the VOI LUT
+        Ok(Self {
+            first_mapped_value,
+            last_mapped_value: first_mapped_value + lut_data.len() as u16 - 1,
+            min_value: lut_data[0],
+            max_value: lut_data.last().copied().unwrap_or(lut_data[0]),
+            lut_data,
+        })
+    }
+}
+
+impl TryFrom<&InMemDicomObject> for VoiLut<u8> {
+    type Error = String;
+
+    /// Attempts to create an unsigned 8-bit VOI LUT (`VoiLut<u8>`) from an in-memory DICOM object.
+    ///
+    /// # Errors
+    /// Returns an error if the LUT is signed or if the VOI LUT data cannot be properly extracted.
+    fn try_from(value: &InMemDicomObject) -> Result<Self, Self::Error> {
+        let (lut_length, first_mapped_value, _bits_stored, is_signed, lut_data) =
+            Self::get_lut_data(value)?;
+
+        // Verify the LUT is unsigned
+        if is_signed {
+            return Err("LUT is signed".into());
+        }
+
+        // Parse LUT data depending on its length
+        let lut_data = if lut_length * 2 == lut_data.len() {
+            lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_u16)
+                .map(|x| x as u8)
+                .collect()
+        } else {
+            lut_data.to_vec()
+        };
+
+        // Construct the VOI LUT
+        Ok(Self {
+            first_mapped_value,
+            last_mapped_value: first_mapped_value + lut_data.len() as u16 - 1,
+            min_value: lut_data[0],
+            max_value: lut_data.last().copied().unwrap_or(lut_data[0]),
+            lut_data,
+        })
+    }
+}
+
+impl TryFrom<&InMemDicomObject> for VoiLut<i16> {
+    type Error = String;
+
+    /// Attempts to create a signed 16-bit VOI LUT (`VoiLut<i16>`) from an in-memory DICOM object.
+    ///
+    /// # Errors
+    /// Returns an error if the LUT is not signed, if the LUT is not 16-bit,
+    /// or if the VOI LUT data cannot be properly extracted.
+    fn try_from(value: &InMemDicomObject) -> Result<Self, Self::Error> {
+        let (_lut_length, first_mapped_value, bits_stored, is_signed, lut_data) =
+            Self::get_lut_data(value)?;
+
+        // Verify the LUT is signed and 16-bit
+        if !is_signed {
+            return Err("LUT is not signed".into());
+        }
+
+        if bits_stored != 16 {
+            return Err("LUT is not 16 bits".into());
+        }
+
+        // Parse LUT data as 16-bit signed integers
+        let data: Vec<i16> = lut_data
+            .chunks_exact(2)
+            .map(NativeEndian::read_i16)
+            .collect();
+
+        // Construct the VOI LUT
+        Ok(Self {
+            first_mapped_value,
+            last_mapped_value: first_mapped_value + lut_data.len() as u16 - 1,
+            min_value: data[0],
+            max_value: data.last().copied().unwrap_or(data[0]),
+            lut_data: data.to_vec(),
+        })
+    }
+}
+
+impl TryFrom<&InMemDicomObject> for VoiLut<u16> {
+    type Error = String;
+
+    /// Attempts to create an unsigned 16-bit VOI LUT (`VoiLut<u16>`) from an in-memory DICOM object.
+    ///
+    /// # Errors
+    /// Returns an error if the LUT is signed, if the LUT is not 16-bit,
+    /// or if the VOI LUT data cannot be properly extracted.
+    fn try_from(value: &InMemDicomObject) -> Result<Self, Self::Error> {
+        let (_lut_length, first_mapped_value, bits_stored, is_signed, lut_data) =
+            Self::get_lut_data(value)?;
+
+        // Verify the LUT is unsigned and 16-bit
+        if is_signed {
+            return Err("LUT is signed".into());
+        }
+
+        if bits_stored != 16 {
+            return Err("LUT is not 16 bits".into());
+        }
+
+        // Parse LUT data as 16-bit unsigned integers
+        let data: Vec<u16> = lut_data
+            .chunks_exact(2)
+            .map(NativeEndian::read_u16)
+            .collect();
+
+        // Construct the VOI LUT
+        Ok(Self {
+            first_mapped_value,
+            last_mapped_value: first_mapped_value + lut_data.len() as u16 - 1,
+            min_value: data[0],
+            max_value: data.last().copied().unwrap_or(data[0]),
+            lut_data: data.to_vec(),
+        })
+    }
+}
+
+impl<T> VoiLut<T> {
+    /// Extracts LUT-related data from an in-memory DICOM object.
+    ///
+    /// # Parameters
+    /// - `dcm`: The in-memory DICOM object from which to extract the LUT data.
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// - `lut_length`: Number of entries in the LUT.
+    /// - `first_mapped_value`: The first input value mapped by the LUT.
+    /// - `bits_stored`: Number of bits used to store LUT data.
+    /// - `is_signed`: Whether the LUT contains signed values.
+    /// - `lut_data`: The LUT data as a byte slice.
+    ///
+    /// # Errors
+    /// Returns an error if required attributes are missing or invalid.
+    pub fn get_lut_data(
+        dcm: &InMemDicomObject,
+    ) -> Result<(usize, u16, u16, bool, Cow<[u8]>), String> {
+        let lut_explanation = dcm
+            .get(tags::LUT_EXPLANATION)
+            .and_then(|inner| inner.to_str().ok())
+            .unwrap_or_default();
+
+        let Some(lut_descriptor) = dcm
+            .get(tags::LUT_DESCRIPTOR)
+            .and_then(|descriptor| descriptor.uint16_slice().ok())
+        else {
+            return Err("Invalid LUT_DESCRIPTOR".into());
+        };
+
+        // Verify LUT Descriptor length (must have 3 elements)
+        if lut_descriptor.len() != 3 {
+            let error = format!(
+                "Invalid LUT Descriptor: {:?} on {:?}",
+                lut_descriptor, lut_explanation
+            );
+            return Err(error);
+        }
+
+        // Determine LUT length, handling the special case where it's represented as 0
+        let lut_length = match lut_descriptor[0] {
+            0 => 65536,
+            _ => lut_descriptor[0] as usize,
+        };
+
+        // Determine if the LUT contains signed values
+        let is_signed = dcm
+            .get(tags::PIXEL_REPRESENTATION)
+            .and_then(|inner| inner.uint8().ok())
+            .unwrap_or(0)
+            == 1;
+
+        let Some(lut_data) = dcm
+            .get(tags::LUT_DATA)
+            .and_then(|inner| inner.to_bytes().ok())
+        else {
+            return Err("Invalid LUT_DATA".into());
+        };
+
+        // Return extracted LUT data
+        Ok((
+            lut_length,
+            lut_descriptor[1],
+            lut_descriptor[2],
+            is_signed,
+            lut_data,
+        ))
+    }
 }
 
 /// VOI LUT function specifier.
@@ -2204,23 +2452,21 @@ where
             .map(|inner| vec![inner])
             .unwrap_or_default();
 
-        let window = window
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let window = window.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
 
-        let voi_lut_function = voi_lut_function
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let voi_lut_function = voi_lut_function.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {

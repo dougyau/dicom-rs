@@ -618,6 +618,7 @@ dependencies = [
 name = "dicom-pixeldata"
 version = "0.8.1"
 dependencies = [
+ "bytemuck",
  "byteorder",
  "clap",
  "dicom-core",

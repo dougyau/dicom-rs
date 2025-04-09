@@ -148,6 +148,7 @@ pub(crate) mod transform;
 
 // re-exports
 pub use attribute::{PhotometricInterpretation, PixelRepresentation, PlanarConfiguration};
+use dicom_dictionary_std::tags;
 pub use lut::{CreateLutError, Lut};
 pub use transcode::{Error as TranscodeError, Result as TranscodeResult, Transcode};
 pub use transform::{Rescale, VoiLutFunction, WindowLevel, WindowLevelTransform};
@@ -2263,7 +2264,14 @@ where
         let voi_lut_sequence = self
             .get(tags::VOILUT_SEQUENCE)
             .and_then(|inner| inner.items())
-            .map(|items| items.to_vec());
+            .map(|items| items.to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                let name = item.get(tags::LUT_EXPLANATION)?.string().ok()?;
+                Some((name.to_string(), item))
+            })
+            .collect();
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
@@ -2380,28 +2388,33 @@ where
             .map(|inner| vec![inner])
             .unwrap_or_default();
 
-        let window = window
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let window = window.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
 
-        let voi_lut_function = voi_lut_function
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let voi_lut_function = voi_lut_function.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
 
         let voi_lut_sequence = self
             .get(tags::VOILUT_SEQUENCE)
             .and_then(|inner| inner.items())
-            .map(|items| items.to_vec());
+            .map(|items| items.to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                let name = item.get(tags::LUT_EXPLANATION)?.string().ok()?;
+                Some((name.to_string(), item))
+            })
+            .collect();
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {

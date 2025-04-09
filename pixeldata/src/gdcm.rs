@@ -2,9 +2,10 @@
 
 use crate::{
     DecodePixelDataSnafu, DecodedPixelData, GetAttributeSnafu, InvalidPixelDataSnafu,
-    LengthMismatchRescaleSnafu, LengthMismatchWindowLevelSnafu, PixelDecoder, Rescale, Result,
-    UnknownTransferSyntaxSnafu, UnsupportedPhotometricInterpretationSnafu,
-    UnsupportedTransferSyntaxSnafu, VoiLutFunction, WindowLevel,
+    LengthMismatchRescaleSnafu, LengthMismatchWindowLevelSnafu, PixelDecoder, PixelRepresentation,
+    Rescale, Result, UnknownTransferSyntaxSnafu, UnsupportedPhotometricInterpretationSnafu,
+    UnsupportedTransferSyntaxSnafu, VoiLutFunction, VoiLutSequence, VoiLutSequenceItem,
+    WindowLevel,
 };
 use dicom_core::{DataDictionary, DicomValue};
 use dicom_dictionary_std::tags;
@@ -130,7 +131,6 @@ where
             DicomValue::Sequence(_) => InvalidPixelDataSnafu.fail()?,
         };
 
-
         let rescale = zip(&rescale_intercept, &rescale_slope)
             .map(|(intercept, slope)| Rescale {
                 intercept: *intercept,
@@ -177,6 +177,7 @@ where
             pixel_representation,
             rescale,
             voi_lut_function,
+            voi_lut_sequence: get_voi_lut_sequence(self, pixel_representation),
             window,
             enforce_frame_fg_vm_match: false,
         })
@@ -353,8 +354,9 @@ where
             bits_stored,
             high_bit,
             pixel_representation,
-            rescale: rescale,
+            rescale,
             voi_lut_function,
+            voi_lut_sequence: get_voi_lut_sequence(self, pixel_representation),
             window,
             enforce_frame_fg_vm_match: false,
         })
@@ -386,6 +388,48 @@ fn interleave_planes(cols: usize, rows: usize, bits_allocated: usize, data: Vec<
     }
 
     interleaved
+}
+
+fn get_voi_lut_sequence<D>(
+    dcm: &FileDicomObject<InMemDicomObject<D>>,
+    pixel_representation: PixelRepresentation,
+) -> VoiLutSequence
+where
+    D: DataDictionary + Clone,
+{
+    dcm.get(tags::VOILUT_SEQUENCE)
+        .and_then(|inner| inner.items())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let lut_descriptor = item
+                        .get(tags::LUT_DESCRIPTOR)
+                        .and_then(|v| v.uint16_slice().ok());
+                    let lut_data = item
+                        .get(tags::LUT_DATA)
+                        .and_then(|inner| inner.to_bytes().ok());
+                    let lut_explanation = item
+                        .get(tags::LUT_EXPLANATION)
+                        .and_then(|inner| inner.string().ok())
+                        .unwrap_or_default();
+
+                    match (lut_descriptor, lut_data) {
+                        (Some(lut_descriptor), Some(lut_data)) => {
+                            let voi_lut = VoiLutSequenceItem::new(
+                                lut_descriptor,
+                                matches!(pixel_representation, PixelRepresentation::Signed),
+                                &lut_data,
+                            );
+
+                            Some((lut_explanation.to_string(), voi_lut))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect::<VoiLutSequence>()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

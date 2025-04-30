@@ -105,13 +105,15 @@
 use byteorder::{ByteOrder, NativeEndian};
 #[cfg(not(feature = "gdcm"))]
 use dicom_core::{DataDictionary, DicomValue};
+use dicom_dictionary_std::tags;
 use dicom_encoding::adapters::DecodeError;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 #[cfg(not(feature = "gdcm"))]
 use dicom_encoding::Codec;
 #[cfg(not(feature = "gdcm"))]
-use dicom_object::{FileDicomObject, InMemDicomObject};
+use dicom_object::FileDicomObject;
+use dicom_object::InMemDicomObject;
 #[cfg(not(feature = "gdcm"))]
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 #[cfg(feature = "image")]
@@ -129,6 +131,8 @@ use snafu::ensure;
 use snafu::OptionExt;
 use snafu::{Backtrace, ResultExt, Snafu};
 use std::borrow::Cow;
+use std::convert::TryFrom;
+use std::fmt::Debug;
 #[cfg(not(feature = "gdcm"))]
 use std::iter::zip;
 
@@ -227,19 +231,34 @@ pub enum InnerError {
         frame_number: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of VOI LUT Function must match the number of frames. Expected `{:?}`, found `{:?}`", nr_frames, vm))]
+    #[snafu(
+        display("Value multiplicity of VOI LUT Function must match the number of frames. Expected `{:?}`, found `{:?}`",
+            nr_frames,
+            vm
+        )
+    )]
     LengthMismatchVoiLutFunction {
         vm: u32,
         nr_frames: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of Rescale Slope/Intercept must match. Found `{:?}` (slope), `{:?}` (intercept)", slope_vm, intercept_vm))]
+    #[snafu(
+        display("Value multiplicity of Rescale Slope/Intercept must match. Found `{:?}` (slope), `{:?}` (intercept)",
+            slope_vm,
+            intercept_vm
+        )
+    )]
     LengthMismatchRescale {
         intercept_vm: u32,
         slope_vm: u32,
         backtrace: Backtrace,
     },
-    #[snafu(display("Value multiplicity of Window Center/Width must match. Found `{:?}` (center), `{:?}` (width)", wc_vm, ww_vm))]
+    #[snafu(
+        display("Value multiplicity of Window Center/Width must match. Found `{:?}` (center), `{:?}` (width)",
+            wc_vm,
+            ww_vm
+        )
+    )]
     LengthMismatchWindowLevel {
         wc_vm: u32,
         ww_vm: u32,
@@ -341,6 +360,95 @@ pub enum ModalityLutOption {
     None,
 }
 
+/// Value of Interest (VOI) LUT (Look-Up Table) representation.
+///
+/// A VOI LUT maps input pixel values to output display values,
+/// allowing for transformations like window leveling or intensity scaling.
+///
+/// The `VoiLut` struct contains metadata and the LUT data itself.
+/// The LUT is represented as a list of mapped values in the appropriate type.
+#[derive(Clone, Debug)]
+pub enum VoiLutSequenceItem {
+    VoiLut {
+        /// The first pixel value mapped by this LUT.
+        first_mapped_value: u16,
+        /// The last pixel value mapped by this LUT.
+        last_mapped_value: u16,
+        /// The minimum value in the LUT data.
+        min_value: i32,
+        /// The maximum value in the LUT data.
+        max_value: i32,
+        /// The actual LUT data, containing the mapped pixel values.
+        lut_data: Vec<i32>,
+    },
+    None,
+}
+
+type VoiLutSequence = Vec<(String, VoiLutSequenceItem)>;
+
+impl VoiLutSequenceItem {
+    pub fn new(lut_descriptor: &[u16], is_signed: bool, lut_data: &[u8]) -> Self {
+        let Ok(lut_descriptor) = <&[u16; 3]>::try_from(lut_descriptor) else {
+            return Self::None;
+        };
+
+        // Determine LUT length, handling the special case where it's represented as 0
+        let lut_length = match lut_descriptor[0] {
+            0 => 65536,
+            _ => lut_descriptor[0] as usize,
+        };
+
+        let is_padded = lut_length * 2 == lut_data.len();
+
+        let lut_data: Vec<i32> = match (lut_descriptor[2], is_signed, is_padded) {
+            (8, true, true) => lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_i16)
+                .map(|x| x as i32)
+                .collect(),
+            (8, true, false) => {
+                let lut_data: &[i8] = bytemuck::cast_slice(&lut_data);
+                lut_data.iter().map(|x| *x as i32).collect()
+            }
+            (8, false, true) => lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_u16)
+                .map(|x| x as i32)
+                .collect(),
+            (8, false, false) => lut_data.iter().map(|x| *x as i32).collect(),
+            (16, true, _) => lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_i16)
+                .map(|x| x as i32)
+                .collect(),
+            (16, false, _) => lut_data
+                .chunks_exact(2)
+                .map(NativeEndian::read_u16)
+                .map(|x| {
+                    // test
+                    x as i32
+                })
+                .collect(),
+            _ => return Self::None,
+        };
+
+        VoiLutSequenceItem::new_item(lut_descriptor, lut_data)
+    }
+
+    fn new_item(lut_descriptor: &[u16; 3], lut_data: Vec<i32>) -> Self {
+        let min_value = lut_data.first().copied().unwrap_or_default();
+        let max_value = lut_data.last().copied().unwrap_or_default();
+
+        Self::VoiLut {
+            first_mapped_value: lut_descriptor[1],
+            last_mapped_value: lut_descriptor[1] + lut_data.len() as u16 - 1,
+            min_value,
+            max_value,
+            lut_data,
+        }
+    }
+}
+
 /// VOI LUT function specifier.
 ///
 /// Note that the VOI LUT function is only applied
@@ -360,6 +468,8 @@ pub enum VoiLutOption {
     /// Apply the first VOI LUT function transformation
     /// described in the pixel data.
     First,
+    /// Apply Custom Pipeline
+    VoiLutModule(String, WindowLevel),
     /// Apply a custom window level instead of the one described in the object.
     Custom(WindowLevel),
     /// Apply a custom window level and a custom function instead of the one described in the object.
@@ -438,6 +548,7 @@ pub struct DecodedPixelData<'a> {
     rescale: Vec<Rescale>,
     // the VOI LUT function
     voi_lut_function: Option<Vec<VoiLutFunction>>,
+    voi_lut_sequence: VoiLutSequence,
     /// the window level specified via width and center
     window: Option<Vec<WindowLevel>>,
 
@@ -960,6 +1071,60 @@ impl DecodedPixelData<'_> {
                                 )
                                 .context(CreateLutSnafu)?
                             }
+                            (VoiLutOption::VoiLutModule(lut_explanation, window), _) => {
+                                let window_transform = WindowLevelTransform::new(
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => {
+                                            if lut.len() > 1 {
+                                                lut[frame as usize]
+                                            } else {
+                                                lut[0]
+                                            }
+                                        }
+                                        None => VoiLutFunction::Linear,
+                                    },
+                                    *window,
+                                );
+                                let y_max = ((1 << 8) - 1) as f64;
+
+                                match self
+                                    .voi_lut_sequence
+                                    .iter()
+                                    .find(|(name, _)| name == lut_explanation)
+                                {
+                                    Some((
+                                        _,
+                                        VoiLutSequenceItem::VoiLut {
+                                            lut_data,
+                                            first_mapped_value,
+                                            last_mapped_value,
+                                            min_value,
+                                            max_value,
+                                        },
+                                    )) => Lut::new_with_fn(16, signed, |x| {
+                                        let rescaled = rescale.apply(x);
+                                        let value = rescaled.floor() as u16;
+
+                                        let mapped = match value {
+                                            x if x < *first_mapped_value => *min_value as f64,
+                                            x if x > *last_mapped_value => *max_value as f64,
+                                            x => *lut_data
+                                                .get((x - first_mapped_value) as usize)
+                                                .unwrap_or(min_value)
+                                                as f64,
+                                        };
+
+                                        window_transform.apply(mapped, y_max)
+                                    }),
+                                    _ => Lut::new_rescale_and_normalize(
+                                        self.bits_stored,
+                                        signed,
+                                        rescale,
+                                        data.iter().copied(),
+                                    ),
+                                }
+                                .context(CreateLutSnafu)?
+                            }
                             (VoiLutOption::Custom(window), _) => Lut::new_rescale_and_window(
                                 8,
                                 signed,
@@ -1108,6 +1273,59 @@ impl DecodedPixelData<'_> {
                                     rescale,
                                     samples.iter().copied(),
                                 )
+                            }
+                            (VoiLutOption::VoiLutModule(lut_explanation, window), _) => {
+                                let window_transform = WindowLevelTransform::new(
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => {
+                                            if lut.len() > 1 {
+                                                lut[frame as usize]
+                                            } else {
+                                                lut[0]
+                                            }
+                                        }
+                                        None => VoiLutFunction::Linear,
+                                    },
+                                    *window,
+                                );
+                                let y_max = ((1 << 16) - 1) as f64;
+
+                                match self
+                                    .voi_lut_sequence
+                                    .iter()
+                                    .find(|(name, _)| name == lut_explanation)
+                                {
+                                    Some((
+                                        _,
+                                        VoiLutSequenceItem::VoiLut {
+                                            lut_data,
+                                            first_mapped_value,
+                                            last_mapped_value,
+                                            min_value,
+                                            max_value,
+                                        },
+                                    )) => Lut::new_with_fn(16, signed, |x| {
+                                        let rescaled = rescale.apply(x);
+                                        let value = rescaled.floor() as u16;
+
+                                        let mapped = match value {
+                                            x if x < *first_mapped_value => *min_value as f64,
+                                            x if x > *last_mapped_value => *max_value as f64,
+                                            x => *lut_data
+                                                .get((x - first_mapped_value) as usize)
+                                                .unwrap_or(min_value)
+                                                as f64,
+                                        };
+
+                                        window_transform.apply(mapped, y_max)
+                                    }),
+                                    _ => Lut::new_rescale_and_normalize(
+                                        self.bits_stored,
+                                        signed,
+                                        rescale,
+                                        samples.iter().copied(),
+                                    ),
+                                }
                             }
                             (VoiLutOption::Custom(window), _) => Lut::new_rescale_and_window(
                                 self.bits_stored,
@@ -1378,6 +1596,59 @@ impl DecodedPixelData<'_> {
                                 tracing::warn!("Could not find window level for object");
                                 Lut::new_rescale(8, signed, rescale)
                             }
+                            (VoiLutOption::VoiLutModule(lut_explanation, window), _) => {
+                                let window_transform = WindowLevelTransform::new(
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => {
+                                            if lut.len() > 1 {
+                                                lut[frame as usize]
+                                            } else {
+                                                lut[0]
+                                            }
+                                        }
+                                        None => VoiLutFunction::Linear,
+                                    },
+                                    *window,
+                                );
+                                let y_max = ((1 << 8) - 1) as f64;
+
+                                match self
+                                    .voi_lut_sequence
+                                    .iter()
+                                    .find(|(name, _)| name == lut_explanation)
+                                {
+                                    Some((
+                                        _,
+                                        VoiLutSequenceItem::VoiLut {
+                                            lut_data,
+                                            first_mapped_value,
+                                            last_mapped_value,
+                                            min_value,
+                                            max_value,
+                                        },
+                                    )) => Lut::new_with_fn(8, signed, |x| {
+                                        let rescaled = rescale.apply(x);
+                                        let value = rescaled.floor() as u16;
+
+                                        let mapped = match value {
+                                            x if x < *first_mapped_value => *min_value as f64,
+                                            x if x > *last_mapped_value => *max_value as f64,
+                                            x => *lut_data
+                                                .get((x - first_mapped_value) as usize)
+                                                .unwrap_or(min_value)
+                                                as f64,
+                                        };
+
+                                        window_transform.apply(mapped, y_max)
+                                    }),
+                                    _ => Lut::new_rescale_and_normalize(
+                                        self.bits_stored,
+                                        signed,
+                                        rescale,
+                                        data.iter().copied(),
+                                    ),
+                                }
+                            }
                             (VoiLutOption::Custom(window), _) => Lut::new_rescale_and_window(
                                 8,
                                 signed,
@@ -1492,6 +1763,59 @@ impl DecodedPixelData<'_> {
                                     rescale,
                                     samples.iter().copied(),
                                 )
+                            }
+                            (VoiLutOption::VoiLutModule(lut_explanation, window), _) => {
+                                let window_transform = WindowLevelTransform::new(
+                                    match self.voi_lut_function()? {
+                                        Some(lut) => {
+                                            if lut.len() > 1 {
+                                                lut[frame as usize]
+                                            } else {
+                                                lut[0]
+                                            }
+                                        }
+                                        None => VoiLutFunction::Linear,
+                                    },
+                                    *window,
+                                );
+                                let y_max = ((1 << 16) - 1) as f64;
+
+                                match self
+                                    .voi_lut_sequence
+                                    .iter()
+                                    .find(|(name, _)| name == lut_explanation)
+                                {
+                                    Some((
+                                        _,
+                                        VoiLutSequenceItem::VoiLut {
+                                            lut_data,
+                                            first_mapped_value,
+                                            last_mapped_value,
+                                            min_value,
+                                            max_value,
+                                        },
+                                    )) => Lut::new_with_fn(16, signed, |x| {
+                                        let rescaled = rescale.apply(x);
+                                        let value = rescaled.floor() as u16;
+
+                                        let mapped = match value {
+                                            x if x < *first_mapped_value => *min_value as f64,
+                                            x if x > *last_mapped_value => *max_value as f64,
+                                            x => *lut_data
+                                                .get((x - first_mapped_value) as usize)
+                                                .unwrap_or(min_value)
+                                                as f64,
+                                        };
+
+                                        window_transform.apply(mapped, y_max)
+                                    }),
+                                    _ => Lut::new_rescale_and_normalize(
+                                        self.bits_stored,
+                                        signed,
+                                        rescale,
+                                        samples.iter().copied(),
+                                    ),
+                                }
                             }
                             (VoiLutOption::Custom(window), _) => Lut::new_rescale_and_window(
                                 self.bits_stored,
@@ -1775,6 +2099,7 @@ impl DecodedPixelData<'_> {
             samples_per_pixel: self.samples_per_pixel,
             rescale: self.rescale.to_vec(),
             voi_lut_function: self.voi_lut_function.clone(),
+            voi_lut_sequence: self.voi_lut_sequence.clone(),
             window: self.window.clone(),
             enforce_frame_fg_vm_match: self.enforce_frame_fg_vm_match,
         }
@@ -2091,6 +2416,41 @@ where
             })
             .collect();
 
+        let voi_lut_sequence = self
+            .get(tags::VOILUT_SEQUENCE)
+            .and_then(|inner| inner.items())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let lut_descriptor = item
+                            .get(tags::LUT_DESCRIPTOR)
+                            .and_then(|v| v.uint16_slice().ok());
+                        let lut_data = item
+                            .get(tags::LUT_DATA)
+                            .and_then(|inner| inner.to_bytes().ok());
+                        let lut_explanation = item
+                            .get(tags::LUT_EXPLANATION)
+                            .and_then(|inner| inner.string().ok())
+                            .unwrap_or_default();
+
+                        match (lut_descriptor, lut_data) {
+                            (Some(lut_descriptor), Some(lut_data)) => {
+                                let voi_lut = VoiLutSequenceItem::new(
+                                    lut_descriptor,
+                                    matches!(pixel_representation, PixelRepresentation::Signed),
+                                    &lut_data,
+                                );
+
+                                Some((lut_explanation.to_string(), voi_lut))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect::<VoiLutSequence>()
+            })
+            .unwrap_or_default();
+
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
             let mut data: Vec<u8> = Vec::new();
@@ -2119,6 +2479,7 @@ where
                 pixel_representation,
                 rescale,
                 voi_lut_function,
+                voi_lut_sequence,
                 window,
                 enforce_frame_fg_vm_match: false,
             });
@@ -2151,6 +2512,7 @@ where
             pixel_representation,
             rescale,
             voi_lut_function,
+            voi_lut_sequence,
             window,
             enforce_frame_fg_vm_match: false,
         })
@@ -2204,23 +2566,56 @@ where
             .map(|inner| vec![inner])
             .unwrap_or_default();
 
-        let window = window
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let window = window.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
 
-        let voi_lut_function = voi_lut_function
-            .and_then(|inner| {
-                inner
-                    .get(frame as usize)
-                    .or(inner.first())
-                    .copied()
-                    .map(|el| vec![el])
-            });
+        let voi_lut_function = voi_lut_function.and_then(|inner| {
+            inner
+                .get(frame as usize)
+                .or(inner.first())
+                .copied()
+                .map(|el| vec![el])
+        });
+
+        let voi_lut_sequence = self
+            .get(tags::VOILUT_SEQUENCE)
+            .and_then(|inner| inner.items())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let lut_descriptor = item
+                            .get(tags::LUT_DESCRIPTOR)
+                            .and_then(|v| v.uint16_slice().ok());
+                        let lut_data = item
+                            .get(tags::LUT_DATA)
+                            .and_then(|inner| inner.to_bytes().ok());
+                        let lut_explanation = item
+                            .get(tags::LUT_EXPLANATION)
+                            .and_then(|inner| inner.string().ok())
+                            .unwrap_or_default();
+
+                        match (lut_descriptor, lut_data) {
+                            (Some(lut_descriptor), Some(lut_data)) => {
+                                let voi_lut = VoiLutSequenceItem::new(
+                                    lut_descriptor,
+                                    matches!(pixel_representation, PixelRepresentation::Signed),
+                                    &lut_data,
+                                );
+
+                                Some((lut_explanation.to_string(), voi_lut))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect::<VoiLutSequence>()
+            })
+            .unwrap_or_default();
 
         // Try decoding it using a registered pixel data decoder
         if let Codec::EncapsulatedPixelData(Some(decoder), _) = ts.codec() {
@@ -2250,6 +2645,7 @@ where
                 pixel_representation,
                 rescale,
                 voi_lut_function,
+                voi_lut_sequence,
                 window,
                 enforce_frame_fg_vm_match: false,
             });
@@ -2297,6 +2693,7 @@ where
             pixel_representation,
             rescale,
             voi_lut_function,
+            voi_lut_sequence,
             window,
             enforce_frame_fg_vm_match: false,
         })
